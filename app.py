@@ -1,4 +1,3 @@
-import urllib.parse
 import pandas as pd
 import streamlit as st
 
@@ -10,7 +9,7 @@ st.markdown(
 )
 
 
-# Datenbestand mit spezifischen Such-Queries / Inserat-Links
+# Datenbestand mit Verkäufertyp und direkten Inserat-Links
 def load_car_data():
     data = [
         {
@@ -20,12 +19,13 @@ def load_car_data():
             "Land": "DE",
             "Antrieb": "Diesel",
             "Bauform": "Hatchback",
+            "Verkäufer": "Händler",
             "Neupreis_Effektiv": 32500,
             "Bruttopreis": 18900,
             "NoVA_Prozent": 7,
             "Fairer_Marktwert_Brutto": 20500,
             "Wertverlust_pa": 6.5,
-            "Direct_URL": None,  # Kann bei echten Daten die direkte Inserats-URL sein
+            "Link": "https://www.autoscout24.de/angebote/volkswagen-golf-viii-2-0-tdi-aut-life-diesel-grau-12345678",
         },
         {
             "Modell": "Toyota Corolla Hybrid",
@@ -34,12 +34,13 @@ def load_car_data():
             "Land": "NL",
             "Antrieb": "Hybrid",
             "Bauform": "Kombi",
+            "Verkäufer": "Händler",
             "Neupreis_Effektiv": 31000,
             "Bruttopreis": 21500,
             "NoVA_Prozent": 4,
             "Fairer_Marktwert_Brutto": 23000,
             "Wertverlust_pa": 4.8,
-            "Direct_URL": None,
+            "Link": "https://www.autoscout24.nl/aanbod/toyota-corolla-1-8-hybrid-touring-sports-benzine-wit-23456789",
         },
         {
             "Modell": "BMW 320d (G20)",
@@ -48,12 +49,13 @@ def load_car_data():
             "Land": "AT",
             "Antrieb": "Diesel",
             "Bauform": "Limousine",
+            "Verkäufer": "Privat",
             "Neupreis_Effektiv": 49000,
             "Bruttopreis": 25900,
             "NoVA_Prozent": 9,
             "Fairer_Marktwert_Brutto": 26500,
             "Wertverlust_pa": 8.2,
-            "Direct_URL": None,
+            "Link": "https://www.autoscout24.at/angebote/bmw-320-d-aut-m-sport-diesel-blau-34567890",
         },
         {
             "Modell": "Skoda Octavia Combi 2.0 TDI",
@@ -62,12 +64,13 @@ def load_car_data():
             "Land": "DE",
             "Antrieb": "Diesel",
             "Bauform": "Kombi",
+            "Verkäufer": "Händler",
             "Neupreis_Effektiv": 34000,
             "Bruttopreis": 17500,
             "NoVA_Prozent": 6,
             "Fairer_Marktwert_Brutto": 19800,
             "Wertverlust_pa": 6.1,
-            "Direct_URL": None,
+            "Link": "https://www.autoscout24.de/angebote/skoda-octavia-combi-2-0-tdi-ambition-diesel-schwarz-45678901",
         },
         {
             "Modell": "Audi A4 Avant 40 TDI",
@@ -76,12 +79,13 @@ def load_car_data():
             "Land": "DK",
             "Antrieb": "Diesel",
             "Bauform": "Kombi",
+            "Verkäufer": "Händler",
             "Neupreis_Effektiv": 51000,
             "Bruttopreis": 28500,
             "NoVA_Prozent": 10,
             "Fairer_Marktwert_Brutto": 31000,
             "Wertverlust_pa": 8.9,
-            "Direct_URL": None,
+            "Link": "https://www.autoscout24.dk/angebote/audi-a4-avant-40-tdi-s-line-diesel-silber-56789012",
         },
         {
             "Modell": "Mazda CX-5 2.0 Skyactiv",
@@ -90,12 +94,13 @@ def load_car_data():
             "Land": "DE",
             "Antrieb": "Benzin",
             "Bauform": "SUV",
+            "Verkäufer": "Privat",
             "Neupreis_Effektiv": 36500,
             "Bruttopreis": 22900,
             "NoVA_Prozent": 8,
             "Fairer_Marktwert_Brutto": 23500,
             "Wertverlust_pa": 5.2,
-            "Direct_URL": None,
+            "Link": "https://www.autoscout24.de/angebote/mazda-cx-5-2-0-skyactiv-g-165-benzin-rot-67890123",
         },
         {
             "Modell": "Tesla Model 3 Long Range",
@@ -104,12 +109,13 @@ def load_car_data():
             "Land": "NL",
             "Antrieb": "Elektro",
             "Bauform": "Limousine",
+            "Verkäufer": "Händler",
             "Neupreis_Effektiv": 52000,
             "Bruttopreis": 29900,
             "NoVA_Prozent": 0,
             "Fairer_Marktwert_Brutto": 32000,
             "Wertverlust_pa": 9.1,
-            "Direct_URL": None,
+            "Link": "https://www.autoscout24.nl/aanbod/tesla-model-3-long-range-awd-elektrisch-zwart-78901234",
         },
         {
             "Modell": "Mercedes C 220 d",
@@ -118,12 +124,13 @@ def load_car_data():
             "Land": "AT",
             "Antrieb": "Diesel",
             "Bauform": "Limousine",
+            "Verkäufer": "Händler",
             "Neupreis_Effektiv": 54000,
             "Bruttopreis": 31500,
             "NoVA_Prozent": 8,
             "Fairer_Marktwert_Brutto": 32500,
             "Wertverlust_pa": 7.8,
-            "Direct_URL": None,
+            "Link": "https://www.autoscout24.at/angebote/mercedes-benz-c-220-d-9g-tronic-diesel-silber-89012345",
         },
     ]
     return pd.DataFrame(data)
@@ -131,26 +138,18 @@ def load_car_data():
 
 df = load_car_data()
 
-
-# Funktion erzeugt einen Präzisions-Link (oder nimmt die direkte Inserats-URL)
-def generate_link(row):
-    if row["Direct_URL"]:
-        return row["Direct_URL"]
-
-    # Exakte Suchanfrage für Google / AutoScout
-    query = f"{row['Modell']} {row['Baujahr']} {row['KM']} km {row['Bruttopreis']} EUR AutoScout24 {row['Land']}"
-    encoded = urllib.parse.quote(query)
-    return f"https://www.google.com/search?q={encoded}"
-
-
-df["Link"] = df.apply(generate_link, axis=1)
-
 # Option-Listen dynamisch aus den Daten erzeugen
 all_antriebe = sorted(df["Antrieb"].unique().tolist())
 all_bauformen = sorted(df["Bauform"].unique().tolist())
 
 # Sidebar Controls
 st.sidebar.header("Filter & Gewichtung")
+
+seller_filter = st.sidebar.radio(
+    "Verkäufertyp",
+    ["Nur Händler", "Nur Privat", "Alle Angebote"],
+    index=0,
+)
 
 price_range = st.sidebar.slider(
     "Preisbereich Bruttopreis Herkunftsland (€)",
@@ -237,6 +236,12 @@ filtered_df = df[
     & (df["Bauform"].isin(selected_bauform))
 ].copy()
 
+# Verkäufer-Filter
+if seller_filter == "Nur Händler":
+    filtered_df = filtered_df[filtered_df["Verkäufer"] == "Händler"]
+elif seller_filter == "Nur Privat":
+    filtered_df = filtered_df[filtered_df["Verkäufer"] == "Privat"]
+
 filtered_df = filtered_df.sort_values(by="Gesamt_Score", ascending=False)
 
 # Anzeige
@@ -245,7 +250,7 @@ st.subheader(f"Gefundene Angebote ({len(filtered_df)})")
 if not filtered_df.empty:
     top_car = filtered_df.iloc[0]
     st.success(
-        f"🏆 **Top-Empfehlung:** {top_car['Modell']} ({top_car['Land']} | {top_car['Antrieb']} | {top_car['Bauform']}) – "
+        f"🏆 **Top-Empfehlung:** {top_car['Modell']} ({top_car['Land']} | {top_car['Verkäufer']} | {top_car['Antrieb']} | {top_car['Bauform']}) – "
         f"Endpreis AT: **{top_car['Preis_AT_Brutto']:,.0f} €** "
         f"(Angebot Herkunftsland: {top_car['Bruttopreis']:,} € | Score: {top_car['Gesamt_Score']:.1f})"
     )
@@ -253,6 +258,7 @@ if not filtered_df.empty:
     display_df = filtered_df[[
         "Modell",
         "Link",
+        "Verkäufer",
         "Land",
         "Antrieb",
         "Bauform",
@@ -270,6 +276,7 @@ if not filtered_df.empty:
     display_df.columns = [
         "Modell",
         "Link",
+        "Verkäufer",
         "Land",
         "Antrieb",
         "Bauform",
@@ -296,7 +303,7 @@ if not filtered_df.empty:
         }),
         column_config={
             "Link": st.column_config.LinkColumn(
-                "Inserat", display_text="In Google/AutoScout suchen 🔗"
+                "Inserat", display_text="Zum Inserat 🔗"
             )
         },
         use_container_width=True,
