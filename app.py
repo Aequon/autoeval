@@ -10,7 +10,7 @@ st.markdown(
 )
 
 
-# Datenbestand mit Inserat-Links (oder automatischen Such-Links)
+# Datenbestand mit spezifischen Such-Queries / Inserat-Links
 def load_car_data():
     data = [
         {
@@ -25,7 +25,7 @@ def load_car_data():
             "NoVA_Prozent": 7,
             "Fairer_Marktwert_Brutto": 20500,
             "Wertverlust_pa": 6.5,
-            "Link": "https://www.autoscout24.at/lst/volkswagen/golf",
+            "Direct_URL": None,  # Kann bei echten Daten die direkte Inserats-URL sein
         },
         {
             "Modell": "Toyota Corolla Hybrid",
@@ -39,7 +39,7 @@ def load_car_data():
             "NoVA_Prozent": 4,
             "Fairer_Marktwert_Brutto": 23000,
             "Wertverlust_pa": 4.8,
-            "Link": "https://www.autoscout24.at/lst/toyota/corolla",
+            "Direct_URL": None,
         },
         {
             "Modell": "BMW 320d (G20)",
@@ -53,7 +53,7 @@ def load_car_data():
             "NoVA_Prozent": 9,
             "Fairer_Marktwert_Brutto": 26500,
             "Wertverlust_pa": 8.2,
-            "Link": "https://www.autoscout24.at/lst/bmw/320",
+            "Direct_URL": None,
         },
         {
             "Modell": "Skoda Octavia Combi 2.0 TDI",
@@ -67,11 +67,12 @@ def load_car_data():
             "NoVA_Prozent": 6,
             "Fairer_Marktwert_Brutto": 19800,
             "Wertverlust_pa": 6.1,
-            "Link": "https://www.autoscout24.at/lst/skoda/octavia",
+            "Direct_URL": None,
         },
         {
             "Modell": "Audi A4 Avant 40 TDI",
-            "Baujahr": 2020, "KM": 90000,
+            "Baujahr": 2020,
+            "KM": 90000,
             "Land": "DK",
             "Antrieb": "Diesel",
             "Bauform": "Kombi",
@@ -80,7 +81,7 @@ def load_car_data():
             "NoVA_Prozent": 10,
             "Fairer_Marktwert_Brutto": 31000,
             "Wertverlust_pa": 8.9,
-            "Link": "https://www.autoscout24.at/lst/audi/a4",
+            "Direct_URL": None,
         },
         {
             "Modell": "Mazda CX-5 2.0 Skyactiv",
@@ -94,7 +95,7 @@ def load_car_data():
             "NoVA_Prozent": 8,
             "Fairer_Marktwert_Brutto": 23500,
             "Wertverlust_pa": 5.2,
-            "Link": "https://www.autoscout24.at/lst/mazda/cx-5",
+            "Direct_URL": None,
         },
         {
             "Modell": "Tesla Model 3 Long Range",
@@ -108,7 +109,7 @@ def load_car_data():
             "NoVA_Prozent": 0,
             "Fairer_Marktwert_Brutto": 32000,
             "Wertverlust_pa": 9.1,
-            "Link": "https://www.autoscout24.at/lst/tesla/model-3",
+            "Direct_URL": None,
         },
         {
             "Modell": "Mercedes C 220 d",
@@ -122,13 +123,27 @@ def load_car_data():
             "NoVA_Prozent": 8,
             "Fairer_Marktwert_Brutto": 32500,
             "Wertverlust_pa": 7.8,
-            "Link": "https://www.autoscout24.at/lst/mercedes-benz/c-220",
+            "Direct_URL": None,
         },
     ]
     return pd.DataFrame(data)
 
 
 df = load_car_data()
+
+
+# Funktion erzeugt einen Präzisions-Link (oder nimmt die direkte Inserats-URL)
+def generate_link(row):
+    if row["Direct_URL"]:
+        return row["Direct_URL"]
+
+    # Exakte Suchanfrage für Google / AutoScout
+    query = f"{row['Modell']} {row['Baujahr']} {row['KM']} km {row['Bruttopreis']} EUR AutoScout24 {row['Land']}"
+    encoded = urllib.parse.quote(query)
+    return f"https://www.google.com/search?q={encoded}"
+
+
+df["Link"] = df.apply(generate_link, axis=1)
 
 # Option-Listen dynamisch aus den Daten erzeugen
 all_antriebe = sorted(df["Antrieb"].unique().tolist())
@@ -281,7 +296,7 @@ if not filtered_df.empty:
         }),
         column_config={
             "Link": st.column_config.LinkColumn(
-                "Inserat", display_text="Zum Angebot 🔗"
+                "Inserat", display_text="In Google/AutoScout suchen 🔗"
             )
         },
         use_container_width=True,
