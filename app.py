@@ -53,9 +53,8 @@ def calculate_fair_net(row):
         return price / 1.60
     return price / 1.20
 
-# Aktualisierte Datenlade-Funktion mit v2 zur Cache-Aktivierung
-@st.cache_data
-def load_car_data_v2():
+# Datenbestand mit Neupreis (rabattiert) und NoVA-Satz
+def load_car_data():
     data = [
         {"Modell": "VW Golf VIII 2.0 TDI", "Baujahr": 2021, "KM": 65000, "Land": "DE", "Neupreis_Effektiv": 32500, "Bruttopreis": 18900, "NoVA_Prozent": 7, "Fairer_Marktwert_Brutto": 20500, "Wertverlust_pa": 6.5},
         {"Modell": "Toyota Corolla Hybrid", "Baujahr": 2022, "KM": 45000, "Land": "NL", "Neupreis_Effektiv": 31000, "Bruttopreis": 21500, "NoVA_Prozent": 4, "Fairer_Marktwert_Brutto": 23000, "Wertverlust_pa": 4.8},
@@ -68,7 +67,7 @@ def load_car_data_v2():
     ]
     return pd.DataFrame(data)
 
-df = load_car_data_v2()
+df = load_car_data()
 
 # Berechnungen
 df["Netto_Vergleichswert"] = df.apply(calculate_net_price, axis=1)
@@ -77,13 +76,13 @@ df["Fairer_Nettowert"] = df.apply(calculate_fair_net, axis=1)
 # Österreich-Endpreis: Netto * 1.20 USt * (1 + NoVA%)
 df["Preis_AT_Brutto"] = df["Netto_Vergleichswert"] * 1.20 * (1 + (df["NoVA_Prozent"] / 100.0))
 
-# PL-Score (Günstiger als Marktwert = Wert > 100)
+# PL_Score (Günstiger als Marktwert = Wert > 100)
 df["PL_Score"] = (df["Fairer_Nettowert"] / df["Netto_Vergleichswert"]) * 100
 
-# WV-Score (Geringer Wertverlust = Höherer Score)
+# WV_Score (Geringer Wertverlust = Höherer Score)
 df["WV_Score"] = 100 - (df["Wertverlust_pa"] * 5)
 
-# Gesamt-Score
+# Gesamt_Score
 df["Gesamt_Score"] = (df["PL_Score"] * weight_focus) + (df["WV_Score"] * (1 - weight_focus))
 
 # Filter anwenden
@@ -109,7 +108,7 @@ if not filtered_df.empty:
     display_df = filtered_df[[
         "Modell", "Land", "Baujahr", "KM", "Neupreis_Effektiv", 
         "Bruttopreis", "Netto_Vergleichswert", "Preis_AT_Brutto", 
-        "PL-Score", "Wertverlust_pa", "Gesamt_Score"
+        "PL_Score", "Wertverlust_pa", "Gesamt_Score"
     ]].copy()
     
     display_df.columns = [
