@@ -30,12 +30,11 @@ def calculate_net_price(row):
     if country == "DE":
         return price / 1.19
     elif country == "AT":
-        # AT Brutto = Netto * 1.20 * (1 + NoVA)
         return price / (1.20 * (1 + nova_pct))
     elif country == "NL":
-        return (price * 0.85) / 1.21  # Bereinigung um geschätzte Rest-BPM & 21% MwSt
+        return (price * 0.85) / 1.21
     elif country == "DK":
-        return price / 1.60          # Bereinigung um Registrierungsabgabe
+        return price / 1.60
     return price / 1.20
 
 # Fairen Nettowert berechnen
@@ -54,9 +53,9 @@ def calculate_fair_net(row):
         return price / 1.60
     return price / 1.20
 
-# Datenbestand mit Neupreis (rabattiert) und NoVA-Satz
+# Aktualisierte Datenlade-Funktion mit v2 zur Cache-Aktivierung
 @st.cache_data
-def load_car_data():
+def load_car_data_v2():
     data = [
         {"Modell": "VW Golf VIII 2.0 TDI", "Baujahr": 2021, "KM": 65000, "Land": "DE", "Neupreis_Effektiv": 32500, "Bruttopreis": 18900, "NoVA_Prozent": 7, "Fairer_Marktwert_Brutto": 20500, "Wertverlust_pa": 6.5},
         {"Modell": "Toyota Corolla Hybrid", "Baujahr": 2022, "KM": 45000, "Land": "NL", "Neupreis_Effektiv": 31000, "Bruttopreis": 21500, "NoVA_Prozent": 4, "Fairer_Marktwert_Brutto": 23000, "Wertverlust_pa": 4.8},
@@ -69,7 +68,7 @@ def load_car_data():
     ]
     return pd.DataFrame(data)
 
-df = load_car_data()
+df = load_car_data_v2()
 
 # Berechnungen
 df["Netto_Vergleichswert"] = df.apply(calculate_net_price, axis=1)
