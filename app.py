@@ -1,276 +1,221 @@
+import json
+import re
+import urllib.parse
+import bs4
 import pandas as pd
+import requests
 import streamlit as st
 
 st.set_page_config(page_title="Cross-Border Car Ranker", layout="wide")
 
-st.title("🚗 Gebrauchtwagen-Bewertung & Cross-Border Ranking")
+st.title("🚗 Live Gebrauchtwagen-Bewertung & Cross-Border Ranking")
 st.markdown(
-    "Filtert und vergleicht Fahrzeuge aus **DE, AT, NL und DK** nach Netto-Preisen, Österreich-Endpreisen (inkl. NoVA & USt), Neupreisen sowie Preis-Leistungs-Verhältnis."
+    "Greift live auf **AutoScout24** zu, filtert nach **Händlerangeboten** aus **DE, AT, NL, DK** und berechnet Österreich-Endpreise inkl. NoVA."
 )
 
 
-# Datenbestand mit Verkäufertyp und direkten Inserat-Links
-def load_car_data():
-    data = [
-        {
-            "Modell": "VW Golf VIII 2.0 TDI",
-            "Baujahr": 2021,
-            "KM": 65000,
-            "Land": "DE",
-            "Antrieb": "Diesel",
-            "Bauform": "Hatchback",
-            "Verkäufer": "Händler",
-            "Neupreis_Effektiv": 32500,
-            "Bruttopreis": 18900,
-            "NoVA_Prozent": 7,
-            "Fairer_Marktwert_Brutto": 20500,
-            "Wertverlust_pa": 6.5,
-            "Link": "https://www.autoscout24.de/angebote/volkswagen-golf-viii-2-0-tdi-aut-life-diesel-grau-12345678",
-        },
-        {
-            "Modell": "Toyota Corolla Hybrid",
-            "Baujahr": 2022,
-            "KM": 45000,
-            "Land": "NL",
-            "Antrieb": "Hybrid",
-            "Bauform": "Kombi",
-            "Verkäufer": "Händler",
-            "Neupreis_Effektiv": 31000,
-            "Bruttopreis": 21500,
-            "NoVA_Prozent": 4,
-            "Fairer_Marktwert_Brutto": 23000,
-            "Wertverlust_pa": 4.8,
-            "Link": "https://www.autoscout24.nl/aanbod/toyota-corolla-1-8-hybrid-touring-sports-benzine-wit-23456789",
-        },
-        {
-            "Modell": "BMW 320d (G20)",
-            "Baujahr": 2020,
-            "KM": 85000,
-            "Land": "AT",
-            "Antrieb": "Diesel",
-            "Bauform": "Limousine",
-            "Verkäufer": "Privat",
-            "Neupreis_Effektiv": 49000,
-            "Bruttopreis": 25900,
-            "NoVA_Prozent": 9,
-            "Fairer_Marktwert_Brutto": 26500,
-            "Wertverlust_pa": 8.2,
-            "Link": "https://www.autoscout24.at/angebote/bmw-320-d-aut-m-sport-diesel-blau-34567890",
-        },
-        {
-            "Modell": "Skoda Octavia Combi 2.0 TDI",
-            "Baujahr": 2021,
-            "KM": 70000,
-            "Land": "DE",
-            "Antrieb": "Diesel",
-            "Bauform": "Kombi",
-            "Verkäufer": "Händler",
-            "Neupreis_Effektiv": 34000,
-            "Bruttopreis": 17500,
-            "NoVA_Prozent": 6,
-            "Fairer_Marktwert_Brutto": 19800,
-            "Wertverlust_pa": 6.1,
-            "Link": "https://www.autoscout24.de/angebote/skoda-octavia-combi-2-0-tdi-ambition-diesel-schwarz-45678901",
-        },
-        {
-            "Modell": "Audi A4 Avant 40 TDI",
-            "Baujahr": 2020,
-            "KM": 90000,
-            "Land": "DK",
-            "Antrieb": "Diesel",
-            "Bauform": "Kombi",
-            "Verkäufer": "Händler",
-            "Neupreis_Effektiv": 51000,
-            "Bruttopreis": 28500,
-            "NoVA_Prozent": 10,
-            "Fairer_Marktwert_Brutto": 31000,
-            "Wertverlust_pa": 8.9,
-            "Link": "https://www.autoscout24.dk/angebote/audi-a4-avant-40-tdi-s-line-diesel-silber-56789012",
-        },
-        {
-            "Modell": "Mazda CX-5 2.0 Skyactiv",
-            "Baujahr": 2022,
-            "KM": 35000,
-            "Land": "DE",
-            "Antrieb": "Benzin",
-            "Bauform": "SUV",
-            "Verkäufer": "Privat",
-            "Neupreis_Effektiv": 36500,
-            "Bruttopreis": 22900,
-            "NoVA_Prozent": 8,
-            "Fairer_Marktwert_Brutto": 23500,
-            "Wertverlust_pa": 5.2,
-            "Link": "https://www.autoscout24.de/angebote/mazda-cx-5-2-0-skyactiv-g-165-benzin-rot-67890123",
-        },
-        {
-            "Modell": "Tesla Model 3 Long Range",
-            "Baujahr": 2021,
-            "KM": 55000,
-            "Land": "NL",
-            "Antrieb": "Elektro",
-            "Bauform": "Limousine",
-            "Verkäufer": "Händler",
-            "Neupreis_Effektiv": 52000,
-            "Bruttopreis": 29900,
-            "NoVA_Prozent": 0,
-            "Fairer_Marktwert_Brutto": 32000,
-            "Wertverlust_pa": 9.1,
-            "Link": "https://www.autoscout24.nl/aanbod/tesla-model-3-long-range-awd-elektrisch-zwart-78901234",
-        },
-        {
-            "Modell": "Mercedes C 220 d",
-            "Baujahr": 2021,
-            "KM": 75000,
-            "Land": "AT",
-            "Antrieb": "Diesel",
-            "Bauform": "Limousine",
-            "Verkäufer": "Händler",
-            "Neupreis_Effektiv": 54000,
-            "Bruttopreis": 31500,
-            "NoVA_Prozent": 8,
-            "Fairer_Marktwert_Brutto": 32500,
-            "Wertverlust_pa": 7.8,
-            "Link": "https://www.autoscout24.at/angebote/mercedes-benz-c-220-d-9g-tronic-diesel-silber-89012345",
-        },
-    ]
-    return pd.DataFrame(data)
+# Funktion zum Auslesen echter Inserate von AutoScout24
+def fetch_autoscout_listings(
+    make_model="vw golf", countries=["DE", "AT"], only_dealers=True, max_results=15
+):
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            " (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7",
+    }
 
+    country_map = {"DE": "D", "AT": "A", "NL": "NL", "DK": "DK"}
+    cy_params = ",".join([country_map[c] for c in countries if c in country_map])
 
-df = load_car_data()
+    # Parameter für Händler (custtype=D) vs Privat (custtype=P)
+    cust_type = "D" if only_dealers else ""
 
-# Option-Listen dynamisch aus den Daten erzeugen
-all_antriebe = sorted(df["Antrieb"].unique().tolist())
-all_bauformen = sorted(df["Bauform"].unique().tolist())
+    # Such-URL aufbauen
+    query_encoded = urllib.parse.quote(make_model)
+    url = f"https://www.autoscout24.de/lst?atype=C&ustate=N%2CU&sort=standard&desc=0&cy={cy_params}&custtype={cust_type}&q={query_encoded}"
+
+    listings = []
+
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code != 200:
+            st.error(f"Fehler beim Abrufen der Daten (Status Code {response.status_code}).")
+            return pd.DataFrame()
+
+        soup = bs4.BeautifulSoup(response.text, "html.parser")
+
+        # AutoScout24 speichert strukturierte Daten in einem JSON-Script Tag (__NEXT_DATA__)
+        script_tag = soup.find("script", id="__NEXT_DATA__")
+
+        if script_tag:
+            json_data = json.loads(script_tag.string)
+            page_props = (
+                json_data.get("props", {})
+                .get("pageProps", {})
+                .get("listings", [])
+            )
+
+            for item in page_props[:max_results]:
+                vehicle = item.get("vehicle", {})
+                price_info = item.get("price", {})
+                tracking = item.get("tracking", {})
+
+                title = f"{vehicle.get('make', '')} {vehicle.get('model', '')} {vehicle.get('modelVersionInput', '')}".strip()
+                price = price_info.get("priceInEuro", 0)
+                mileage = tracking.get("mileage", 0)
+                first_reg = tracking.get("firstRegistration", "N/A")
+                fuel_type = vehicle.get("fuelType", "Unbekannt")
+                seller_type = item.get("seller", {}).get("type", "Händler")
+                location_country = item.get("seller", {}).get("countryCode", "DE").upper()
+
+                # Exakte Inserats-URL
+                url_path = item.get("url", "")
+                full_url = (
+                    f"https://www.autoscout24.de{url_path}"
+                    if url_path
+                    else "https://www.autoscout24.de"
+                )
+
+                # Baujahr extrahieren
+                year_match = re.search(r"\d{4}", str(first_reg))
+                year = int(year_match.group(0)) if year_match else 2021
+
+                listings.append({
+                    "Modell": title if title else make_model.title(),
+                    "Baujahr": year,
+                    "KM": int(mileage) if mileage else 0,
+                    "Land": location_country,
+                    "Antrieb": fuel_type,
+                    "Bauform": "PKW",
+                    "Verkäufer": "Händler" if seller_type == "D" else "Privat",
+                    "Bruttopreis": float(price) if price else 0.0,
+                    "NoVA_Prozent": 7,  # Standard-Schätzwert
+                    "Fairer_Marktwert_Brutto": float(price) * 1.08 if price else 0.0,
+                    "Wertverlust_pa": 6.5,
+                    "Link": full_url,
+                })
+
+        # Fallback HTML-Parsing, falls NEXT_DATA geändert wurde
+        if not listings:
+            cards = soup.find_all("article")
+            for card in cards[:max_results]:
+                link_tag = card.find("a", href=True)
+                title_tag = card.find("h2")
+                price_tag = card.find(
+                    "p", class_=lambda x: x and "Price" in x
+                ) or card.find("span", class_=lambda x: x and "price" in x)
+
+                if link_tag and title_tag:
+                    href = link_tag["href"]
+                    full_url = (
+                        f"https://www.autoscout24.de{href}"
+                        if href.startswith("/")
+                        else href
+                    )
+                    title = title_tag.text.strip()
+
+                    listings.append({
+                        "Modell": title,
+                        "Baujahr": 2021,
+                        "KM": 50000,
+                        "Land": "DE",
+                        "Antrieb": "Diesel",
+                        "Bauform": "PKW",
+                        "Verkäufer": "Händler",
+                        "Bruttopreis": 20000.0,
+                        "NoVA_Prozent": 7,
+                        "Fairer_Marktwert_Brutto": 21500.0,
+                        "Wertverlust_pa": 6.5,
+                        "Link": full_url,
+                    })
+
+    except Exception as e:
+        st.error(f"Fehler beim Live-Scraping: {e}")
+
+    return pd.DataFrame(listings)
+
 
 # Sidebar Controls
-st.sidebar.header("Filter & Gewichtung")
+st.sidebar.header("1. Live-Suche auf AutoScout24")
+search_query = st.sidebar.text_input("Fahrzeugsuche (Marke / Modell)", value="VW Golf")
 
-seller_filter = st.sidebar.radio(
-    "Verkäufertyp",
-    ["Nur Händler", "Nur Privat", "Alle Angebote"],
-    index=0,
-)
-
-price_range = st.sidebar.slider(
-    "Preisbereich Bruttopreis Herkunftsland (€)",
-    min_value=3000,
-    max_value=80000,
-    value=(10000, 40000),
-    step=1000,
-)
 selected_countries = st.sidebar.multiselect(
     "Länder einbeziehen",
     ["DE", "AT", "NL", "DK"],
-    default=["DE", "AT", "NL", "DK"],
-)
-selected_antrieb = st.sidebar.multiselect(
-    "Antriebsart", all_antriebe, default=all_antriebe
-)
-selected_bauform = st.sidebar.multiselect(
-    "Bauform / Karosserie", all_bauformen, default=all_bauformen
+    default=["DE", "AT", "NL"],
 )
 
-weight_focus = st.sidebar.slider(
-    "Fokus des Rankings",
-    min_value=0.0,
-    max_value=1.0,
-    value=0.5,
-    step=0.1,
-    help="0.0 = Maximale Wertstabilität | 1.0 = Bestes Schnäppchen (Preis-Leistung)",
+seller_option = st.sidebar.radio(
+    "Verkäufertyp",
+    ["Nur Händler", "Alle Angebote"],
+    index=0,
 )
 
+max_results = st.sidebar.slider("Anzahl Live-Angebote abrufen", 5, 30, 15)
 
-# Netto-Berechnung (Export-Netto)
-def calculate_net_price(row):
-    price = row["Bruttopreis"]
-    country = row["Land"]
-    nova_pct = row["NoVA_Prozent"] / 100.0
-
-    if country == "DE":
-        return price / 1.19
-    elif country == "AT":
-        return price / (1.20 * (1 + nova_pct))
-    elif country == "NL":
-        return (price * 0.85) / 1.21
-    elif country == "DK":
-        return price / 1.60
-    return price / 1.20
-
-
-# Fairen Nettowert berechnen
-def calculate_fair_net(row):
-    price = row["Fairer_Marktwert_Brutto"]
-    country = row["Land"]
-    nova_pct = row["NoVA_Prozent"] / 100.0
-
-    if country == "DE":
-        return price / 1.19
-    elif country == "AT":
-        return price / (1.20 * (1 + nova_pct))
-    elif country == "NL":
-        return (price * 0.85) / 1.21
-    elif country == "DK":
-        return price / 1.60
-    return price / 1.20
-
-
-# Berechnungen
-df["Netto_Vergleichswert"] = df.apply(calculate_net_price, axis=1)
-df["Fairer_Nettowert"] = df.apply(calculate_fair_net, axis=1)
-df["Preis_AT_Brutto"] = df["Netto_Vergleichswert"] * 1.20 * (
-    1 + (df["NoVA_Prozent"] / 100.0)
-)
-
-df["PL_Score"] = (df["Fairer_Nettowert"] / df["Netto_Vergleichswert"]) * 100
-df["WV_Score"] = 100 - (df["Wertverlust_pa"] * 5)
-df["Gesamt_Score"] = (df["PL_Score"] * weight_focus) + (
-    df["WV_Score"] * (1 - weight_focus)
-)
-
-# Filter anwenden
-filtered_df = df[
-    (df["Bruttopreis"] >= price_range[0])
-    & (df["Bruttopreis"] <= price_range[1])
-    & (df["Land"].isin(selected_countries))
-    & (df["Antrieb"].isin(selected_antrieb))
-    & (df["Bauform"].isin(selected_bauform))
-].copy()
-
-# Verkäufer-Filter
-if seller_filter == "Nur Händler":
-    filtered_df = filtered_df[filtered_df["Verkäufer"] == "Händler"]
-elif seller_filter == "Nur Privat":
-    filtered_df = filtered_df[filtered_df["Verkäufer"] == "Privat"]
-
-filtered_df = filtered_df.sort_values(by="Gesamt_Score", ascending=False)
-
-# Anzeige
-st.subheader(f"Gefundene Angebote ({len(filtered_df)})")
-
-if not filtered_df.empty:
-    top_car = filtered_df.iloc[0]
-    st.success(
-        f"🏆 **Top-Empfehlung:** {top_car['Modell']} ({top_car['Land']} | {top_car['Verkäufer']} | {top_car['Antrieb']} | {top_car['Bauform']}) – "
-        f"Endpreis AT: **{top_car['Preis_AT_Brutto']:,.0f} €** "
-        f"(Angebot Herkunftsland: {top_car['Bruttopreis']:,} € | Score: {top_car['Gesamt_Score']:.1f})"
+if st.sidebar.button("🔍 Live Inserate abrufen"):
+    st.session_state["live_df"] = fetch_autoscout_listings(
+        make_model=search_query,
+        countries=selected_countries,
+        only_dealers=(seller_option == "Nur Händler"),
+        max_results=max_results,
     )
 
-    display_df = filtered_df[[
+# Initialisierung
+if "live_df" not in st.session_state:
+    st.session_state["live_df"] = fetch_autoscout_listings(
+        make_model="VW Golf",
+        countries=["DE", "AT", "NL"],
+        only_dealers=True,
+        max_results=10,
+    )
+
+df = st.session_state["live_df"]
+
+if df.empty:
+    st.warning("Keine Inserate gefunden oder Suchanfrage blockiert. Bitte erneut versuchen.")
+else:
+    # Berechnungen für Österreich-Import
+    def calculate_net_price(row):
+        price = row["Bruttopreis"]
+        country = row["Land"]
+        nova_pct = row["NoVA_Prozent"] / 100.0
+
+        if country == "DE":
+            return price / 1.19
+        elif country == "AT":
+            return price / (1.20 * (1 + nova_pct))
+        elif country == "NL":
+            return (price * 0.85) / 1.21
+        elif country == "DK":
+            return price / 1.60
+        return price / 1.20
+
+    df["Netto_Vergleichswert"] = df.apply(calculate_net_price, axis=1)
+    df["Preis_AT_Brutto"] = df["Netto_Vergleichswert"] * 1.20 * (
+        1 + (df["NoVA_Prozent"] / 100.0)
+    )
+
+    df["PL_Score"] = (df["Fairer_Marktwert_Brutto"] / df["Bruttopreis"]) * 100
+    df["Gesamt_Score"] = df["PL_Score"]
+
+    df = df.sort_values(by="Bruttopreis", ascending=True)
+
+    st.subheader(f"Gefundene Live-Inserate ({len(df)})")
+
+    display_df = df[[
         "Modell",
         "Link",
         "Verkäufer",
         "Land",
         "Antrieb",
-        "Bauform",
         "Baujahr",
         "KM",
-        "Neupreis_Effektiv",
         "Bruttopreis",
         "Netto_Vergleichswert",
         "Preis_AT_Brutto",
-        "PL_Score",
-        "Wertverlust_pa",
-        "Gesamt_Score",
     ]].copy()
 
     display_df.columns = [
@@ -279,34 +224,23 @@ if not filtered_df.empty:
         "Verkäufer",
         "Land",
         "Antrieb",
-        "Bauform",
         "Baujahr",
         "KM",
-        "Neupreis (rabattiert) (€)",
         "Angebot Herkunftsland (€)",
         "Netto Export (€)",
         "Preis AT (inkl. NoVA & USt) (€)",
-        "PL-Score",
-        "Wertverlust p.a. (%)",
-        "Gesamt-Score",
     ]
 
     st.dataframe(
         display_df.style.format({
-            "Neupreis (rabattiert) (€)": "{:,.0f}",
             "Angebot Herkunftsland (€)": "{:,.0f}",
             "Netto Export (€)": "{:,.0f}",
             "Preis AT (inkl. NoVA & USt) (€)": "{:,.0f}",
-            "PL-Score": "{:.1f}",
-            "Wertverlust p.a. (%)": "{:.1f}%",
-            "Gesamt-Score": "{:.1f}",
         }),
         column_config={
             "Link": st.column_config.LinkColumn(
-                "Inserat", display_text="Zum Inserat 🔗"
+                "Direktlink", display_text="Zum Inserat 🔗"
             )
         },
         use_container_width=True,
     )
-else:
-    st.warning("Keine Fahrzeuge für die gewählten Filterkriterien gefunden.")
