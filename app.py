@@ -1,362 +1,851 @@
+"""
+AutoScout24 Import-Ranker (AT)
+==============================
+
+Scrapt AutoScout24-Inserate und rankt sie nach *echtem* Preisvorteil:
+Endpreis in Österreich (inkl. NoVA / USt-Logik / Nebenkosten) gegen einen
+aus den Daten selbst geschätzten Marktwert desselben Modells.
+
+Start:  streamlit run autoscout_ranker.py
+
+Alle Steuerparameter stehen oben in KONSTANTEN und sind im UI überschreibbar.
+Keine Steuerberatung – NoVA-Tarife vor 2024 bitte gegenprüfen.
+"""
+
+from __future__ import annotations
+
+import io
 import json
+import math
 import re
 import time
 import urllib.parse
-import bs4
-import cloudscraper
+from dataclasses import dataclass, field
+from typing import Any, Callable
+
+import numpy as np
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(
-    page_title="AutoScout24 Live All-Listing Ranker", layout="wide"
-)
+# =============================================================================
+# KONSTANTEN / STEUERPARAMETER
+# =============================================================================
 
-st.title("🚗 Live AutoScout24 Kategorie-Scraper & Ranking")
-st.markdown(
-    "Durchsucht **alle verfügbaren Live-Seiten** auf AutoScout24 in DE, AT, NL, DK "
-    "und berechnet den Österreich-Endpreis (inkl. NoVA & USt-Anpassung)."
-)
+AKTUELLES_JAHR = 2026
 
-# Kategorie-Mapping für AutoScout24
-CATEGORY_MAP = {
-    "SUV / Crossover": {"body_code": "6", "query": "SUV"},
-    "Kombi": {"body_code": "5", "query": "Kombi"},
-    "Elektroauto": {"body_code": "", "query": "Elektro"},
-    "Kleinwagen / Kompaktklasse": {"body_code": "2", "query": "Kompakt"},
-    "Limousine": {"body_code": "3", "query": "Limousine"},
-    "Alle Kategorien (Kein Filter)": {"body_code": "", "query": ""},
+# NoVA-Tarif nach Jahr der ERSTZULASSUNG im EU-Raum (maßgeblich ist der Tarif
+# zum Zeitpunkt des erstmaligen Inverkehrbringens, nicht der Importzeitpunkt).
+# 2024–2026 recherchiert; 2021–2023 mit dem Steuerberater gegenprüfen.
+NOVA_TARIF: dict[int, dict[str, float]] = {
+    2021: {"abzug": 112, "malus_ab": 200, "malus_satz": 50},
+    2022: {"abzug": 107, "malus_ab": 185, "malus_satz": 60},
+    2023: {"abzug": 102, "malus_ab": 170, "malus_satz": 70},
+    2024: {"abzug": 97, "malus_ab": 155, "malus_satz": 80},
+    2025: {"abzug": 94, "malus_ab": 155, "malus_satz": 80},
+    2026: {"abzug": 91, "malus_ab": 155, "malus_satz": 80},
+}
+NOVA_MAX_SATZ = 80.0          # Höchststeuersatz M1 in %
+NOVA_ABZUGSPOSTEN = 350.0     # € Abzugsposten, wird aliquotiert (Achtelung)
+UST_AT = 0.20
+LUXUSTANGENTE_BRUTTO = 40_000.0   # Angemessenheitsgrenze E-Pkw
+VORSTEUER_DECKEL = LUXUSTANGENTE_BRUTTO / 1.20 * 0.20   # 6.666,67 €
+
+# AutoScout24-Marktplätze (DK gibt es dort nicht – bewusst nicht in der Liste).
+LAENDER = {
+    "DE": "D", "AT": "A", "BE": "B", "ES": "E",
+    "FR": "F", "IT": "I", "LU": "L", "NL": "NL",
 }
 
+KRAFTSTOFF = {
+    "Elektro": "E",
+    "Benzin": "B",
+    "Diesel": "D",
+    "Hybrid (Benzin/Elektro)": "2",
+    "Hybrid (Diesel/Elektro)": "3",
+    "Egal": "",
+}
 
-# Multi-Page Live Scraper (Läd ALLE verfügbaren Seiten)
-def fetch_all_autoscout_pages(
-    category_name,
-    countries=["DE", "AT"],
-    only_dealers=True,
-    max_pages_limit=10,
-):
-    cat_info = CATEGORY_MAP.get(
-        category_name, CATEGORY_MAP["Alle Kategorien (Kein Filter)"]
+MAX_SEITEN_AS24 = 20          # harte Grenze der Suche: 20 Seiten × 20 = 400
+TREFFER_PRO_SEITE = 20
+BASIS_URL = "https://www.autoscout24.de/lst"
+
+
+# =============================================================================
+# 1. STEUER- UND KOSTENLOGIK
+# =============================================================================
+
+@dataclass
+class Kaufprofil:
+    """Wer kauft, und wie wirkt sich das auf den Endpreis aus."""
+    unternehmer_vorsteuer: bool = False   # E-Pkw, überwiegend betrieblich
+    nebenkosten: float = 600.0            # Überstellung, Typisierung, Anmeldung
+    km_pauschale_pro_100km: float = 0.0   # optional: Abholkosten
+    entfernung_km: float = 0.0
+
+
+def nova_tarif(jahr: int) -> dict[str, float]:
+    if jahr in NOVA_TARIF:
+        return NOVA_TARIF[jahr]
+    if jahr < min(NOVA_TARIF):
+        return NOVA_TARIF[min(NOVA_TARIF)]
+    # Fortschreibung: Abzugsposten sinkt um 3 g/Jahr
+    letztes = max(NOVA_TARIF)
+    t = dict(NOVA_TARIF[letztes])
+    t["abzug"] = max(0, t["abzug"] - 3 * (jahr - letztes))
+    return t
+
+
+def nova_satz(co2: float, erstzulassung_jahr: int) -> float:
+    """NoVA-Steuersatz in Prozent (ohne Malus)."""
+    t = nova_tarif(erstzulassung_jahr)
+    satz = round((co2 - t["abzug"]) / 5.0)
+    return float(min(max(satz, 0.0), NOVA_MAX_SATZ))
+
+
+def nova_betrag(
+    bemessung_netto: float,
+    co2: float,
+    erstzulassung_jahr: int,
+    alter_jahre: float,
+    ist_elektro: bool,
+) -> tuple[float, float]:
+    """
+    Liefert (NoVA in €, angewandter Satz in %).
+
+    Malus und Abzugsposten werden über die Achtelung aliquotiert
+    (1/8 pro vollem Jahr seit Erstzulassung, nach 8 Jahren = 0).
+    """
+    if ist_elektro:
+        return 0.0, 0.0
+    if co2 is None or (isinstance(co2, float) and math.isnan(co2)) or co2 <= 0:
+        return float("nan"), float("nan")   # CO2 unbekannt -> nicht raten
+
+    t = nova_tarif(erstzulassung_jahr)
+    satz = nova_satz(co2, erstzulassung_jahr)
+    achtel = max(0.0, 1.0 - math.floor(max(alter_jahre, 0)) / 8.0)
+
+    grund = bemessung_netto * satz / 100.0
+    malus = max(0.0, co2 - t["malus_ab"]) * t["malus_satz"] * achtel
+    abzug = NOVA_ABZUGSPOSTEN * achtel
+    return max(0.0, grund + malus - abzug), satz
+
+
+def endpreis_at(zeile: pd.Series, profil: Kaufprofil) -> pd.Series:
+    """
+    Rechnet ein Inserat auf den effektiven Endpreis in Österreich um.
+
+    Entscheidend sind drei Dinge, die das alte Skript ignoriert hat:
+
+    1) Gebrauchtwagen-Import (>6 Monate UND >6.000 km) löst KEINE
+       österreichische Erwerbsteuer aus. Ein Privatkäufer zahlt den
+       Bruttopreis des Verkäuferlandes – nicht "netto + 20 % AT-USt".
+    2) Differenzbesteuert vs. Regelbesteuert ("MwSt. ausweisbar"):
+       Nur bei Regelbesteuerung kann ein vorsteuerabzugsberechtigter
+       Unternehmer die USt zurückholen. Das sind ~17 % Unterschied.
+    3) NoVA fällt beim Import auch auf Gebrauchte an, bemessen am
+       gemeinen Wert (netto, also ohne NoVA und ohne fiktive 20 % USt).
+    """
+    brutto = float(zeile["Bruttopreis"])
+    land = str(zeile["Land"])
+    co2 = float(zeile.get("CO2", float("nan")))
+    ist_elektro = bool(zeile["Elektro"])
+    jahr = int(zeile["Baujahr"])
+    alter = max(0.0, AKTUELLES_JAHR + 0.5 - jahr)
+    ust_satz = 1.20 if land == "AT" else float(zeile.get("USt_Satz", 1.19))
+    regelbesteuert = bool(zeile.get("MwSt_ausweisbar", False))
+    neufahrzeug = (alter <= 0.5) or (float(zeile["KM"]) <= 6000)
+
+    # --- Inländisches Angebot: NoVA ist bereits enthalten -------------------
+    if land == "AT":
+        nova = 0.0
+        satz = 0.0
+        if profil.unternehmer_vorsteuer and regelbesteuert:
+            effektiv = brutto / 1.20
+        else:
+            effektiv = brutto
+    else:
+        # Bemessungsgrundlage NoVA: Bruttopreis herausgerechnet um
+        # fiktive 20 % USt und die NoVA selbst.
+        satz_vorab = 0.0 if ist_elektro else (
+            nova_satz(co2, jahr) if co2 and co2 > 0 else 0.0
+        )
+        gemeiner_wert = brutto / (1.0 + UST_AT + satz_vorab / 100.0)
+        nova, satz = nova_betrag(gemeiner_wert, co2, jahr, alter, ist_elektro)
+
+        if profil.unternehmer_vorsteuer and regelbesteuert:
+            # Netto einkaufen (ig. Lieferung), Erwerbsteuer neutralisiert sich
+            netto = brutto / ust_satz
+            effektiv = netto + (0.0 if pd.isna(nova) else nova)
+            # Deckel Luxustangente: über 40k brutto nur begrenzter Abzug
+            brutto_at = netto * 1.20 + (0.0 if pd.isna(nova) else nova)
+            if brutto_at > LUXUSTANGENTE_BRUTTO:
+                effektiv = brutto_at - VORSTEUER_DECKEL
+        elif neufahrzeug:
+            # "Neufahrzeug" i.S.d. UStG: netto kaufen, 20 % AT-Erwerbsteuer
+            netto = brutto / ust_satz
+            effektiv = netto * 1.20 + (0.0 if pd.isna(nova) else nova)
+        else:
+            effektiv = brutto + (0.0 if pd.isna(nova) else nova)
+
+    nebenkosten = profil.nebenkosten + (
+        profil.entfernung_km / 100.0 * profil.km_pauschale_pro_100km
     )
-    body_code = cat_info["body_code"]
-    search_term = cat_info["query"]
+    if land == "AT":
+        nebenkosten = min(nebenkosten, 150.0)
+
+    return pd.Series({
+        "NoVA_EUR": nova,
+        "NoVA_Satz": satz,
+        "Nebenkosten": nebenkosten,
+        "Endpreis_AT": effektiv + nebenkosten,
+    })
+
+
+# =============================================================================
+# 2. SCRAPER
+# =============================================================================
+
+def _pfad(obj: Any, pfad: str) -> Any:
+    cur = obj
+    for key in pfad.split("."):
+        if isinstance(cur, dict) and key in cur:
+            cur = cur[key]
+        elif isinstance(cur, list) and key.isdigit() and int(key) < len(cur):
+            cur = cur[int(key)]
+        else:
+            return None
+    return cur
+
+
+def hole(obj: Any, *pfade: str, default: Any = None) -> Any:
+    """Erster Pfad, der einen nicht-leeren Wert liefert (schemastabil)."""
+    for p in pfade:
+        val = _pfad(obj, p)
+        if val not in (None, "", [], {}):
+            return val
+    return default
+
+
+def _zahl(wert: Any) -> float:
+    if wert is None:
+        return float("nan")
+    if isinstance(wert, (int, float)):
+        return float(wert)
+    treffer = re.sub(r"[^\d,.\-]", "", str(wert)).replace(".", "").replace(",", ".")
+    try:
+        return float(treffer)
+    except ValueError:
+        return float("nan")
+
+
+def parse_inserat(item: dict) -> dict | None:
+    """Ein Roh-Inserat in eine flache Zeile übersetzen. None = unbrauchbar."""
+    preis = _zahl(hole(
+        item,
+        "price.priceInEuro", "price.raw", "price.amountInEuro",
+        "prices.public.amountInEuroCents", "tracking.price",
+        "price.priceFormatted",
+    ))
+    if not np.isfinite(preis) or preis <= 0:
+        return None
+    if preis > 1_000_000:      # Cent-Feld erwischt
+        preis /= 100.0
+
+    marke = str(hole(item, "vehicle.make", "tracking.make", default="")).strip()
+    modell = str(hole(item, "vehicle.model", "tracking.model", default="")).strip()
+    variante = str(hole(
+        item, "vehicle.modelVersionInput", "vehicle.subtitle", default=""
+    )).strip()
+
+    erstzul = str(hole(
+        item,
+        "vehicle.firstRegistrationDateRaw", "vehicle.firstRegistrationDate",
+        "tracking.firstRegistration", default="",
+    ))
+    jahr_treffer = re.search(r"(19|20)\d{2}", erstzul)
+    jahr = int(jahr_treffer.group(0)) if jahr_treffer else 0
+
+    km = _zahl(hole(
+        item, "tracking.mileage", "vehicle.mileageInKmRaw", "vehicle.mileage",
+    ))
+    kw = _zahl(hole(
+        item, "tracking.powerInKW", "vehicle.rawPowerInKw", "vehicle.powerInKw",
+    ))
+    co2 = _zahl(hole(
+        item,
+        "tracking.co2Emission", "vehicle.co2EmissionInGramPerKm",
+        "vehicle.emissionClass.co2", "vehicle.co2Emissions",
+    ))
+
+    kraftstoff = str(hole(
+        item, "vehicle.fuelCategory.formatted", "tracking.fuelType",
+        "vehicle.fuelType", default="",
+    ))
+    ist_elektro = bool(re.search(r"elektro|electric|\bev\b", kraftstoff, re.I))
+    if ist_elektro:
+        co2 = 0.0
+
+    # MwSt.-Ausweisbarkeit: entscheidet über Vorsteuerabzug.
+    mwst_flag = hole(
+        item, "price.vatDeductible", "price.vatReclaimable",
+        "tracking.vatReclaimable", "price.vatRate", "vehicle.vatDeductible",
+    )
+    if isinstance(mwst_flag, bool):
+        mwst_ausweisbar = mwst_flag
+    elif isinstance(mwst_flag, (int, float)):
+        mwst_ausweisbar = mwst_flag > 0
+    elif isinstance(mwst_flag, str):
+        mwst_ausweisbar = bool(re.search(r"ausweis|deduct|reclaim|19|20", mwst_flag))
+    else:
+        mwst_ausweisbar = False       # konservativ: differenzbesteuert annehmen
+
+    land = str(hole(
+        item, "seller.countryCode", "location.countryCode",
+        "tracking.sellerCountry", default="DE",
+    )).upper()[:2]
+    ust_saetze = {"DE": 1.19, "AT": 1.20, "NL": 1.21, "BE": 1.21,
+                  "FR": 1.20, "IT": 1.22, "ES": 1.21, "LU": 1.17}
+
+    pfad_url = str(hole(item, "url", "detailPageUrl", default=""))
+    link = pfad_url if pfad_url.startswith("http") else (
+        f"https://www.autoscout24.de{pfad_url}" if pfad_url else ""
+    )
+
+    return {
+        "ID": str(hole(item, "id", "guid", default=link)),
+        "Marke": marke or "?",
+        "Modell": modell or "?",
+        "Variante": variante,
+        "Bezeichnung": f"{marke} {modell} {variante}".strip() or "Gebrauchtwagen",
+        "Baujahr": jahr,
+        "KM": km,
+        "kW": kw,
+        "CO2": co2,
+        "Kraftstoff": kraftstoff or "unbekannt",
+        "Elektro": ist_elektro,
+        "Land": land,
+        "USt_Satz": ust_saetze.get(land, 1.20),
+        "MwSt_ausweisbar": mwst_ausweisbar,
+        "Verkäufer": "Händler" if str(hole(
+            item, "seller.type", default="D")).upper().startswith("D") else "Privat",
+        "Bruttopreis": preis,
+        "Link": link,
+    }
+
+
+def baue_url(filter_params: dict[str, str], seite: int) -> str:
+    params = {k: v for k, v in filter_params.items() if v not in ("", None)}
+    params["page"] = str(seite)
+    params.setdefault("atype", "C")
+    params.setdefault("ustate", "N,U")
+    params.setdefault("size", str(TREFFER_PRO_SEITE))
+    return f"{BASIS_URL}?{urllib.parse.urlencode(params, safe=',')}"
+
+
+def params_aus_url(url: str) -> dict[str, str]:
+    """Erlaubt: fertige Suche im Browser bauen und URL hier einfügen."""
+    zerlegt = urllib.parse.urlparse(url)
+    params = {k: v[0] for k, v in urllib.parse.parse_qs(zerlegt.query).items()}
+    params.pop("page", None)
+    params.pop("search_id", None)
+    return params
+
+
+def _extrahiere_json(html: str) -> dict | None:
+    import bs4
+    suppe = bs4.BeautifulSoup(html, "html.parser")
+    tag = suppe.find("script", id="__NEXT_DATA__")
+    if tag and tag.string:
+        try:
+            return json.loads(tag.string)
+        except json.JSONDecodeError:
+            pass
+    # Fallback, falls AutoScout die ID ändert: größten JSON-Block suchen
+    for m in re.finditer(r'<script[^>]*type="application/json"[^>]*>(.*?)</script>',
+                         html, re.S):
+        try:
+            daten = json.loads(m.group(1))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(daten, dict) and "listings" in json.dumps(daten)[:200_000]:
+            return daten
+    return None
+
+
+def _finde_listings(daten: dict) -> tuple[list, int, int]:
+    props = hole(daten, "props.pageProps", default={}) or {}
+    such = hole(props, "searchResult", "listings.searchResult", default={}) or {}
+    listings = (hole(such, "listings") or hole(props, "listings")
+                or hole(daten, "listings") or [])
+    seiten = int(_zahl(hole(such, "numberOfPages",
+                            default=hole(props, "numberOfPages", default=1))) or 1)
+    treffer = int(_zahl(hole(such, "totalMatches", "numberOfResults",
+                             default=hole(props, "totalMatches", default=0))) or 0)
+    return listings, seiten, treffer
+
+
+@dataclass
+class Abrufbericht:
+    seiten_geladen: int = 0
+    treffer_gesamt: int = 0
+    fehler: list[str] = field(default_factory=list)
+
+
+def scrape(
+    filter_params: dict[str, str],
+    max_seiten: int,
+    bericht: Abrufbericht,
+    fortschritt: Callable[[float, str], None] | None = None,
+) -> list[dict]:
+    """Lädt bis max_seiten Seiten einer Suche. Fehler landen im Bericht."""
+    import cloudscraper
 
     scraper = cloudscraper.create_scraper(
         browser={"browser": "chrome", "platform": "windows", "desktop": True}
     )
+    zeilen: list[dict] = []
+    seite, seiten_gesamt = 1, 1
 
-    country_map = {"DE": "D", "AT": "A", "NL": "NL", "DK": "DK"}
-    cy_params = ",".join(
-        [country_map[c] for c in countries if c in country_map]
-    )
-    cust_type = "D" if only_dealers else ""
-
-    all_listings = []
-    current_page = 1
-    total_pages = 1
-    total_matches = 0
-
-    status_text = st.empty()
-    progress_bar = st.progress(0)
-
-    while current_page <= total_pages and current_page <= max_pages_limit:
-        status_text.text(
-            f"⏳ Lade AutoScout24 Seite {current_page} von {min(total_pages, max_pages_limit)}..."
-        )
-
-        url = f"https://www.autoscout24.de/lst?atype=C&ustate=N%2CU&sort=standard&desc=0&cy={cy_params}&custtype={cust_type}&page={current_page}"
-        if body_code:
-            url += f"&body={body_code}"
-        if search_term:
-            url += f"&q={urllib.parse.quote(search_term)}"
-
-        try:
-            response = scraper.get(url, timeout=10)
-            if response.status_code != 200:
-                break
-
-            soup = bs4.BeautifulSoup(response.text, "html.parser")
-            script_tag = soup.find("script", id="__NEXT_DATA__")
-
-            if not script_tag:
-                break
-
-            json_data = json.loads(script_tag.string)
-            page_props = json_data.get("props", {}).get("pageProps", {})
-            search_result = page_props.get("searchResult", {})
-
-            # Dynamische Bestimmung der Gesamtseitenanzahl von AutoScout
-            total_pages = search_result.get(
-                "numberOfPages", 1
-            ) or page_props.get("numberOfPages", 1)
-            total_matches = search_result.get(
-                "totalMatches", 0
-            ) or page_props.get("totalMatches", 0)
-
-            raw_listings = search_result.get(
-                "listings", []
-            ) or page_props.get("listings", [])
-
-            if not raw_listings:
-                break
-
-            for item in raw_listings:
-                vehicle = item.get("vehicle", {})
-                price_info = item.get("price", {})
-                tracking = item.get("tracking", {})
-                seller = item.get("seller", {})
-
-                make = vehicle.get("make", "")
-                model = vehicle.get("model", "")
-                variant = vehicle.get("modelVersionInput", "")
-                title = f"{make} {model} {variant}".strip()
-
-                try:
-                    price = float(
-                        price_info.get("priceInEuro")
-                        or price_info.get("raw")
-                        or 0
-                    )
-                except (ValueError, TypeError):
-                    price = 0.0
-
-                if price <= 0:
-                    continue
-
-                try:
-                    mileage = int(tracking.get("mileage", 0))
-                except (ValueError, TypeError):
-                    mileage = 0
-
-                first_reg = tracking.get("firstRegistration", "")
-                year_match = re.search(r"\d{4}", str(first_reg))
-                year = int(year_match.group(0)) if year_match else 2021
-
-                fuel_type = vehicle.get("fuelType", "Benzin/Diesel")
-                body_type = vehicle.get("bodyType", category_name)
-                seller_label = (
-                    "Händler" if seller.get("type", "D") == "D" else "Privat"
-                )
-                country_code = seller.get("countryCode", "DE").upper()
-
-                url_path = item.get("url", "")
-                full_url = (
-                    f"https://www.autoscout24.de{url_path}"
-                    if url_path
-                    else "https://www.autoscout24.de"
-                )
-
-                nova_est = (
-                    0
-                    if "elektro" in fuel_type.lower() or "ev" in title.lower()
-                    else 7
-                )
-
-                all_listings.append({
-                    "Modell": title if title else "Gebrauchtwagen",
-                    "Baujahr": year,
-                    "KM": mileage,
-                    "Land": country_code,
-                    "Antrieb": fuel_type,
-                    "Bauform": body_type,
-                    "Verkäufer": seller_label,
-                    "Bruttopreis": price,
-                    "Neupreis_Effektiv": round(price * 1.4, -2),
-                    "Fairer_Marktwert_Brutto": round(price * 1.08, -2),
-                    "NoVA_Prozent": nova_est,
-                    "Wertverlust_pa": 6.2,
-                    "Link": full_url,
-                })
-
-            progress = min(current_page / max(min(total_pages, max_pages_limit), 1), 1.0)
-            progress_bar.progress(progress)
-
-            current_page += 1
-            time.sleep(0.5)  # Sanfter Abstand zwischen Anfragen
-
-        except Exception:
+    while seite <= min(seiten_gesamt, max_seiten, MAX_SEITEN_AS24):
+        url = baue_url(filter_params, seite)
+        html = None
+        for versuch in range(3):
+            try:
+                antwort = scraper.get(url, timeout=20)
+                if antwort.status_code == 200:
+                    html = antwort.text
+                    break
+                bericht.fehler.append(f"Seite {seite}: HTTP {antwort.status_code}")
+            except Exception as exc:                       # noqa: BLE001
+                bericht.fehler.append(f"Seite {seite}: {type(exc).__name__}: {exc}")
+            time.sleep(1.5 * (versuch + 1))
+        if html is None:
             break
 
-    status_text.empty()
-    progress_bar.empty()
+        daten = _extrahiere_json(html)
+        if daten is None:
+            bericht.fehler.append(
+                f"Seite {seite}: kein __NEXT_DATA__ gefunden "
+                "(Seitenstruktur geändert oder Bot-Schutz aktiv)."
+            )
+            break
 
-    return pd.DataFrame(all_listings), total_matches
+        roh, seiten_gesamt, treffer = _finde_listings(daten)
+        bericht.treffer_gesamt = max(bericht.treffer_gesamt, treffer)
+        if not roh:
+            break
+
+        for item in roh:
+            zeile = parse_inserat(item)
+            if zeile:
+                zeilen.append(zeile)
+
+        bericht.seiten_geladen += 1
+        if fortschritt:
+            obergrenze = max(1, min(seiten_gesamt, max_seiten, MAX_SEITEN_AS24))
+            fortschritt(min(seite / obergrenze, 1.0),
+                        f"Seite {seite}/{obergrenze} – {len(zeilen)} Inserate")
+        seite += 1
+        time.sleep(0.6)
+
+    return zeilen
 
 
-# --- SIDEBAR CONTROLS ---
-st.sidebar.header("1. Live-Kategoriesuche auf AutoScout24")
+def scrape_mit_preisbaendern(
+    filter_params: dict[str, str],
+    preis_von: int,
+    preis_bis: int,
+    max_seiten: int,
+    fortschritt: Callable[[float, str], None] | None = None,
+) -> tuple[pd.DataFrame, Abrufbericht]:
+    """
+    Umgeht das 400-Treffer-Limit: Wenn die Suche mehr Treffer hat als
+    abrufbar sind, wird sie in Preisbänder zerlegt und jedes Band separat
+    geladen. Aus max. 400 werden so schnell 2.000+ Inserate.
+    """
+    bericht = Abrufbericht()
 
-category_choice = st.sidebar.selectbox(
-    "Fahrzeugkategorie wählen",
-    [
-        "SUV / Crossover",
-        "Kombi",
-        "Elektroauto",
-        "Kleinwagen / Kompaktklasse",
-        "Limousine",
-        "Alle Kategorien (Kein Filter)",
-    ],
-)
+    sonde = dict(filter_params, pricefrom=str(preis_von), priceto=str(preis_bis))
+    erste = scrape(sonde, 1, bericht)
+    gesamt = bericht.treffer_gesamt or len(erste)
 
-selected_countries = st.sidebar.multiselect(
-    "Länder einbeziehen",
-    ["DE", "AT", "NL", "DK"],
-    default=["DE", "AT", "NL", "DK"],
-)
-
-seller_option = st.sidebar.radio(
-    "Verkäufertyp",
-    ["Nur Händler", "Alle Angebote"],
-    index=0,
-)
-
-max_pages_limit = st.sidebar.slider(
-    "Maximale Seitenanzahl abrufen (20 Inserate/Seite)",
-    min_value=1,
-    max_value=20,
-    value=10,
-    help="AutoScout24 beschränkt Suchen auf max. 20 Seiten (400 Treffer).",
-)
-
-if st.sidebar.button("🔍 ALLE verfügbaren Inserate laden"):
-    df_res, total_matches = fetch_all_autoscout_pages(
-        category_name=category_choice,
-        countries=selected_countries,
-        only_dealers=(seller_option == "Nur Händler"),
-        max_pages_limit=max_pages_limit,
-    )
-    st.session_state["live_df"] = df_res
-    st.session_state["total_matches"] = total_matches
-
-# Initialer Zustand
-if "live_df" not in st.session_state:
-    st.session_state["live_df"] = pd.DataFrame()
-    st.session_state["total_matches"] = 0
-
-df = st.session_state["live_df"]
-total_matches = st.session_state.get("total_matches", 0)
-
-# --- ANZEIGE DER ERGEBNISSE ---
-if not df.empty:
-    st.success(
-        f"✅ Erfolgreich **{len(df)} Live-Inserate** geladen! "
-        f"(Insgesamt auf AutoScout24 für diese Filter verfügbar: **~{total_matches} Fahrzeuge**)"
+    kapazitaet = min(max_seiten, MAX_SEITEN_AS24) * TREFFER_PRO_SEITE
+    n_baender = 1 if gesamt <= kapazitaet else min(
+        12, math.ceil(gesamt / max(kapazitaet * 0.8, 1))
     )
 
-    # --- SIDEBAR FILTER & GEWICHTUNG ---
-    st.sidebar.header("2. Budget & Ranking")
+    # geometrische Bandgrenzen: unten sind die Inserate dichter
+    grenzen = np.unique(np.round(np.geomspace(
+        max(preis_von, 500), max(preis_bis, preis_von + 1000), n_baender + 1
+    )).astype(int))
 
-    min_p = int(df["Bruttopreis"].min())
-    max_p = int(df["Bruttopreis"].max())
+    alle: list[dict] = []
+    for i in range(len(grenzen) - 1):
+        von = grenzen[i] + (1 if i else 0)
+        bis = grenzen[i + 1]
+        band = dict(filter_params, pricefrom=str(von), priceto=str(bis))
 
-    price_range = st.sidebar.slider(
-        "Preisbereich (€ Herkunftsland)",
-        min_value=min_p,
-        max_value=max_p,
-        value=(min_p, max_p),
-        step=1000,
-    )
+        def melde(p: float, txt: str, i=i, von=von, bis=bis) -> None:
+            if fortschritt:
+                fortschritt((i + p) / max(len(grenzen) - 1, 1),
+                            f"Preisband {von:,}–{bis:,} € · {txt}".replace(",", "."))
 
-    weight_focus = st.sidebar.slider(
-        "Fokus des Rankings",
-        min_value=0.0,
-        max_value=1.0,
-        value=0.5,
-        step=0.1,
-        help="0.0 = Hohe Wertstabilität | 1.0 = Bestes Preis-Leistungs-Verhältnis",
-    )
+        alle.extend(scrape(band, max_seiten, bericht, melde))
 
-    # BERECHNUNGEN
-    def calculate_net_price(row):
-        price = row["Bruttopreis"]
-        country = row["Land"]
-        nova_pct = row["NoVA_Prozent"] / 100.0
+    df = pd.DataFrame(alle)
+    if not df.empty:
+        df = df.drop_duplicates(subset="ID").reset_index(drop=True)
+    return df, bericht
 
-        if country == "DE":
-            return price / 1.19
-        elif country == "AT":
-            return price / (1.20 * (1 + nova_pct))
-        elif country == "NL":
-            return (price * 0.85) / 1.21
-        elif country == "DK":
-            return price / 1.60
-        return price / 1.20
 
-    df["Netto_Vergleichswert"] = df.apply(calculate_net_price, axis=1)
-    df["Preis_AT_Brutto"] = df["Netto_Vergleichswert"] * 1.20 * (
-        1 + (df["NoVA_Prozent"] / 100.0)
-    )
+# =============================================================================
+# 3. PLAUSIBILITÄT & MARKTWERTMODELL
+# =============================================================================
 
-    df["PL_Score"] = (df["Fairer_Marktwert_Brutto"] / df["Bruttopreis"]) * 100
-    df["WV_Score"] = 100 - (df["Wertverlust_pa"] * 5)
-    df["Gesamt_Score"] = (df["PL_Score"] * weight_focus) + (
-        df["WV_Score"] * (1 - weight_focus)
-    )
-
-    filtered_df = df[
-        (df["Bruttopreis"] >= price_range[0])
-        & (df["Bruttopreis"] <= price_range[1])
-    ].copy()
-
-    filtered_df = filtered_df.sort_values(by="Gesamt_Score", ascending=False)
-
-    top_car = filtered_df.iloc[0]
-    st.info(
-        f"🏆 **Testsieger ({category_choice}):** {top_car['Modell']} ({top_car['Land']}) – "
-        f"Österreich-Endpreis: **{top_car['Preis_AT_Brutto']:,.0f} €** "
-        f"(Angebot Herkunftsland: {top_car['Bruttopreis']:,.0f} € | Score: {top_car['Gesamt_Score']:.1f}/100)"
-    )
-
-    display_df = filtered_df[[
-        "Modell",
-        "Link",
-        "Verkäufer",
-        "Land",
-        "Antrieb",
-        "Baujahr",
-        "KM",
-        "Bruttopreis",
-        "Netto_Vergleichswert",
-        "Preis_AT_Brutto",
-        "PL_Score",
-        "Wertverlust_pa",
-        "Gesamt_Score",
-    ]].copy()
-
-    display_df.columns = [
-        "Modell",
-        "Link",
-        "Verkäufer",
-        "Land",
-        "Antrieb",
-        "Baujahr",
-        "KM",
-        "Preis Herkunftsland (€)",
-        "Netto Export (€)",
-        "Preis AT (inkl. NoVA & USt) (€)",
-        "PL-Score",
-        "Wertverlust p.a. (%)",
-        "Gesamt-Score",
+def saeubern(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """Unplausible Zeilen raus – sonst verzerren sie das Preismodell."""
+    if df.empty:
+        return df, 0
+    vorher = len(df)
+    d = df.copy()
+    d["KM"] = pd.to_numeric(d["KM"], errors="coerce")
+    d["kW"] = pd.to_numeric(d["kW"], errors="coerce")
+    d = d[
+        d["Bruttopreis"].between(800, 400_000)
+        & d["Baujahr"].between(1990, AKTUELLES_JAHR + 1)
+        & (d["KM"].fillna(0) <= 600_000)
     ]
+    # kW fehlend -> Median der Modellgruppe
+    d["kW"] = d.groupby(["Marke", "Modell"])["kW"].transform(
+        lambda s: s.fillna(s.median())
+    )
+    d["kW"] = d["kW"].fillna(d["kW"].median()).fillna(100.0)
+    d["KM"] = d["KM"].fillna(d["KM"].median()).fillna(50_000)
+    return d.reset_index(drop=True), vorher - len(d)
+
+
+def _designmatrix(g: pd.DataFrame) -> np.ndarray:
+    alter = np.maximum(0.25, AKTUELLES_JAHR + 0.5 - g["Baujahr"].to_numpy(float))
+    km = np.maximum(100.0, g["KM"].to_numpy(float))
+    kw = np.maximum(30.0, g["kW"].to_numpy(float))
+    return np.column_stack([
+        np.ones(len(g)), np.log(alter), np.log(km / 10_000.0), np.log(kw)
+    ])
+
+
+def _fit_robust(X: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """OLS auf log-Preis, danach einmal getrimmt nachfitten (Ausreißer raus)."""
+    beta, *_ = np.linalg.lstsq(X, y, rcond=None)
+    resid = y - X @ beta
+    mad = np.median(np.abs(resid - np.median(resid))) * 1.4826
+    if mad > 1e-6:
+        behalten = np.abs(resid) <= 2.5 * mad
+        if behalten.sum() >= X.shape[1] + 3:
+            beta, *_ = np.linalg.lstsq(X[behalten], y[behalten], rcond=None)
+    return beta
+
+
+def marktwert_modell(
+    df: pd.DataFrame,
+    zielspalte: str = "Endpreis_AT",
+    min_modell: int = 8,
+    min_marke: int = 15,
+) -> pd.DataFrame:
+    """
+    Schätzt für jedes Inserat den erwarteten Marktpreis aus vergleichbaren
+    Inseraten desselben Modells (Alter, Laufleistung, Leistung).
+
+    Das ist der Kern: Ranking = wie weit liegt ein Angebot unter dem, was
+    dieses Modell in diesem Zustand tatsächlich kostet. Das alte
+    `Marktwert = Preis * 1.08` ergab für jedes Auto denselben Score.
+    """
+    d = df.copy()
+    d["Erwartungspreis"] = np.nan
+    d["Vergleichsgruppe"] = "—"
+    d["n_Vergleiche"] = 0
+
+    y_alle = np.log(d[zielspalte].to_numpy(float))
+
+    def anwenden(idx: pd.Index, label: str) -> None:
+        g = d.loc[idx]
+        X = _designmatrix(g)
+        y = y_alle[d.index.get_indexer(idx)]
+        beta = _fit_robust(X, y)
+        d.loc[idx, "Erwartungspreis"] = np.exp(X @ beta)
+        d.loc[idx, "Vergleichsgruppe"] = label
+        d.loc[idx, "n_Vergleiche"] = len(idx)
+
+    offen = set(d.index)
+
+    modellgruppen = {k: v for k, v in d.groupby(["Marke", "Modell"], sort=False).groups.items()}
+    for (marke, modell), idx in modellgruppen.items():
+        if len(idx) >= min_modell:
+            anwenden(idx, f"{marke} {modell}")
+            offen -= set(idx)
+
+    markengruppen = {
+        k: pd.Index([i for i in v if i in offen])
+        for k, v in d.groupby("Marke", sort=False).groups.items()
+    }
+    for marke, idx in markengruppen.items():
+        if len(idx) >= min_marke:
+            anwenden(idx, f"{marke} (Markenschnitt)")
+            offen -= set(idx)
+
+    if offen and len(d) >= 25:
+        anwenden(pd.Index(sorted(offen)), "Gesamtmarkt (grob)")
+
+    d["Preisvorteil_EUR"] = d["Erwartungspreis"] - d[zielspalte]
+    d["Preisvorteil_Pct"] = d["Preisvorteil_EUR"] / d["Erwartungspreis"] * 100
+    # Shrinkage: kleine Gruppen dürfen nicht das Ranking gewinnen
+    d["Konfidenz"] = d["n_Vergleiche"] / (d["n_Vergleiche"] + 6.0)
+    d["Score"] = d["Preisvorteil_Pct"] * d["Konfidenz"]
+    d["Warnung"] = np.where(
+        d["Preisvorteil_Pct"] > 35,
+        "⚠︎ >35 % unter Markt – Unfall/Export/Motorschaden prüfen", ""
+    )
+    return d
+
+
+# =============================================================================
+# 4. UI
+# =============================================================================
+
+def _sidebar_filter() -> tuple[dict[str, str], int, int, int]:
+    st.sidebar.header("1 · Suche")
+
+    modus = st.sidebar.radio(
+        "Filter definieren über",
+        ["Eigene AutoScout24-URL", "Formular"],
+        help="Am robustesten: Suche im Browser zusammenklicken, URL kopieren, "
+             "hier einfügen. Dann stimmen Karosserie-/Ausstattungscodes sicher.",
+    )
+
+    if modus == "Eigene AutoScout24-URL":
+        url = st.sidebar.text_area(
+            "URL einfügen", height=90,
+            placeholder="https://www.autoscout24.de/lst/...",
+        )
+        params = params_aus_url(url) if url.strip() else {}
+        if url.strip() and not params:
+            st.sidebar.error("Konnte keine Filter aus der URL lesen.")
+    else:
+        laender = st.sidebar.multiselect(
+            "Länder", list(LAENDER), default=["DE", "AT"],
+            help="Dänemark ist kein AutoScout24-Markt und daher nicht wählbar.",
+        )
+        kraftstoff = st.sidebar.selectbox("Antrieb", list(KRAFTSTOFF), index=0)
+        nur_haendler = st.sidebar.checkbox("Nur Händler", value=True)
+        bj_von, bj_bis = st.sidebar.select_slider(
+            "Erstzulassung", options=list(range(2010, AKTUELLES_JAHR + 1)),
+            value=(2021, AKTUELLES_JAHR),
+        )
+        km_max = st.sidebar.number_input("km max.", 0, 500_000, 120_000, 10_000)
+        params = {
+            "cy": ",".join(LAENDER[c] for c in laender),
+            "fuel": KRAFTSTOFF[kraftstoff],
+            "custtype": "D" if nur_haendler else "",
+            "fregfrom": str(bj_von), "fregto": str(bj_bis),
+            "kmto": str(int(km_max)),
+            "damaged_listing": "exclude",
+            "sort": "standard", "desc": "0",
+        }
+
+    preis_von, preis_bis = st.sidebar.slider(
+        "Preisbereich im Herkunftsland (€)",
+        2_000, 120_000, (20_000, 38_000), step=1_000,
+    )
+    max_seiten = st.sidebar.slider(
+        "Seiten je Preisband", 1, MAX_SEITEN_AS24, 8,
+        help="20 Inserate/Seite. Bei vielen Treffern wird die Suche automatisch "
+             "in Preisbänder zerlegt, um das 400-Treffer-Limit zu umgehen.",
+    )
+    return params, preis_von, preis_bis, max_seiten
+
+
+def _sidebar_profil() -> Kaufprofil:
+    st.sidebar.header("2 · Kaufprofil (Steuerlogik)")
+    unternehmer = st.sidebar.checkbox(
+        "Vorsteuerabzugsberechtigt (E-Pkw, betrieblich)",
+        value=False,
+        help="Nur bei reinen E-Pkw und nur bei Angeboten mit ausweisbarer "
+             "MwSt. Bis 40.000 € brutto voller Abzug, darüber gedeckelt.",
+    )
+    nebenkosten = st.sidebar.number_input(
+        "Nebenkosten Import (€)", 0, 5_000, 600, 50,
+        help="Überstellungskennzeichen, §57a/Typisierung, NoVA-Anmeldung.",
+    )
+    entfernung = st.sidebar.number_input("Abholentfernung (km)", 0, 3_000, 0, 50)
+    satz = st.sidebar.number_input("Kosten je 100 km (€)", 0, 100, 25, 5)
+    return Kaufprofil(unternehmer, float(nebenkosten), float(satz), float(entfernung))
+
+
+def main() -> None:
+    st.set_page_config(page_title="AutoScout24 Import-Ranker", layout="wide")
+    st.title("🚗 AutoScout24 Import-Ranker (Österreich)")
+    st.caption(
+        "Rankt Inserate nach echtem Preisvorteil: Endpreis in AT inkl. NoVA "
+        "und USt-Logik gegen einen aus den Daten geschätzten Marktwert."
+    )
+
+    params, preis_von, preis_bis, max_seiten = _sidebar_filter()
+    profil = _sidebar_profil()
+
+    if st.sidebar.button("🔍 Inserate laden", type="primary"):
+        balken = st.progress(0.0)
+        text = st.empty()
+
+        def fortschritt(p: float, msg: str) -> None:
+            balken.progress(min(max(p, 0.0), 1.0))
+            text.text(f"⏳ {msg}")
+
+        with st.spinner("Lade AutoScout24 …"):
+            df, bericht = scrape_mit_preisbaendern(
+                params, preis_von, preis_bis, max_seiten, fortschritt
+            )
+        balken.empty()
+        text.empty()
+        st.session_state["df"] = df
+        st.session_state["bericht"] = bericht
+
+    df: pd.DataFrame = st.session_state.get("df", pd.DataFrame())
+    bericht: Abrufbericht = st.session_state.get("bericht", Abrufbericht())
+
+    if df.empty:
+        st.info(
+            "Links Filter setzen und **Inserate laden** klicken. "
+            "Tipp: eng gefasste Suchen liefern bessere Vergleichsgruppen als "
+            "„alle Kategorien“ – das Preismodell braucht ≥8 Inserate pro Modell."
+        )
+        if bericht.fehler:
+            with st.expander("Diagnose"):
+                for f in bericht.fehler:
+                    st.text(f)
+        return
+
+    df, verworfen = saeubern(df)
+    steuern = df.apply(lambda z: endpreis_at(z, profil), axis=1)
+    df = pd.concat([df, steuern], axis=1)
+    ohne_co2 = int(df["NoVA_EUR"].isna().sum())
+    df["NoVA_EUR"] = df["NoVA_EUR"].fillna(0.0)
+    df["Endpreis_AT"] = df["Endpreis_AT"].fillna(df["Bruttopreis"])
+
+    df = marktwert_modell(df)
+    df = df.dropna(subset=["Erwartungspreis"])
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Inserate", f"{len(df):,}".replace(",", "."))
+    k2.metric("Auf AS24 gesamt", f"~{bericht.treffer_gesamt:,}".replace(",", "."))
+    k3.metric("Seiten geladen", bericht.seiten_geladen)
+    k4.metric("Ø Endpreis AT", f"{df['Endpreis_AT'].mean():,.0f} €".replace(",", "."))
+
+    if verworfen or ohne_co2:
+        st.caption(
+            f"{verworfen} unplausible Zeilen entfernt · "
+            f"{ohne_co2} Inserate ohne CO₂-Wert (NoVA dort mit 0 angesetzt – "
+            "vor dem Kauf prüfen)."
+        )
+
+    st.sidebar.header("3 · Ranking")
+    min_vorteil = st.sidebar.slider("Mind. Preisvorteil (%)", -10, 40, 0)
+    nur_mit_mwst = st.sidebar.checkbox(
+        "Nur Angebote mit ausweisbarer MwSt.",
+        value=profil.unternehmer_vorsteuer,
+    )
+    budget = st.sidebar.number_input(
+        "Budget Endpreis AT (€)", 0, 200_000, 35_000, 1_000
+    )
+
+    gefiltert = df[
+        (df["Preisvorteil_Pct"] >= min_vorteil)
+        & (df["Endpreis_AT"] <= budget)
+    ]
+    if nur_mit_mwst:
+        gefiltert = gefiltert[gefiltert["MwSt_ausweisbar"]]
+    gefiltert = gefiltert.sort_values("Score", ascending=False)
+
+    if gefiltert.empty:
+        st.warning("Keine Treffer nach Filterung – Budget oder Mindestvorteil lockern.")
+        return
+
+    top = gefiltert.iloc[0]
+    st.success(
+        f"🏆 **{top['Bezeichnung']}** ({top['Land']}, EZ {top['Baujahr']}, "
+        f"{top['KM']:,.0f} km) – Endpreis AT **{top['Endpreis_AT']:,.0f} €** "
+        f"gegen erwartete {top['Erwartungspreis']:,.0f} € → "
+        f"**{top['Preisvorteil_Pct']:.1f} % unter Markt** "
+        f"(Vergleichsgruppe: {top['Vergleichsgruppe']}, "
+        f"n={int(top['n_Vergleiche'])})".replace(",", ".")
+    )
+
+    spalten = [
+        "Bezeichnung", "Link", "Land", "Verkäufer", "Baujahr", "KM", "kW",
+        "Kraftstoff", "MwSt_ausweisbar", "Bruttopreis", "NoVA_EUR",
+        "Endpreis_AT", "Erwartungspreis", "Preisvorteil_EUR",
+        "Preisvorteil_Pct", "Vergleichsgruppe", "n_Vergleiche", "Warnung",
+    ]
+    anzeige = gefiltert[spalten].rename(columns={
+        "MwSt_ausweisbar": "MwSt. ausweisbar",
+        "Bruttopreis": "Preis Herkunftsland",
+        "NoVA_EUR": "NoVA",
+        "Endpreis_AT": "Endpreis AT",
+        "Preisvorteil_EUR": "Vorteil €",
+        "Preisvorteil_Pct": "Vorteil %",
+        "n_Vergleiche": "n",
+    })
 
     st.dataframe(
-        display_df.style.format({
-            "Preis Herkunftsland (€)": "{:,.0f}",
-            "Netto Export (€)": "{:,.0f}",
-            "Preis AT (inkl. NoVA & USt) (€)": "{:,.0f}",
-            "PL-Score": "{:.1f}",
-            "Wertverlust p.a. (%)": "{:.1f}%",
-            "Gesamt-Score": "{:.1f}",
+        anzeige.style.format({
+            "KM": "{:,.0f}", "kW": "{:.0f}",
+            "Preis Herkunftsland": "{:,.0f} €", "NoVA": "{:,.0f} €",
+            "Endpreis AT": "{:,.0f} €", "Erwartungspreis": "{:,.0f} €",
+            "Vorteil €": "{:+,.0f} €", "Vorteil %": "{:+.1f} %",
         }),
         column_config={
-            "Link": st.column_config.LinkColumn(
-                "Direktlink", display_text="Zum Inserat 🔗"
-            )
+            "Link": st.column_config.LinkColumn("Inserat", display_text="öffnen ↗"),
         },
-        use_container_width=True,
+        hide_index=True,
+        height=560,
     )
 
-else:
-    st.warning(
-        "Klicke in der Seitenleiste auf **'🔍 ALLE verfügbaren Inserate laden'**, um den Live-Abruf für die gewählte Kategorie zu starten."
+    puffer = io.StringIO()
+    gefiltert.to_csv(puffer, index=False)
+    st.download_button(
+        "⬇︎ Ergebnis als CSV", puffer.getvalue(),
+        file_name="autoscout_ranking.csv", mime="text/csv",
     )
+
+    with st.expander("Preisvorteil nach Modell"):
+        uebersicht = (
+            gefiltert.groupby("Vergleichsgruppe")
+            .agg(Inserate=("ID", "count"),
+                 Median_Endpreis=("Endpreis_AT", "median"),
+                 Bester_Vorteil=("Preisvorteil_Pct", "max"))
+            .sort_values("Bester_Vorteil", ascending=False)
+        )
+        st.dataframe(uebersicht.style.format({
+            "Median_Endpreis": "{:,.0f} €", "Bester_Vorteil": "{:+.1f} %",
+        }))
+
+    with st.expander("Rechenannahmen & Diagnose"):
+        st.markdown(
+            f"""
+- **NoVA** nach Tarif des Erstzulassungsjahres, Malus und Abzugsposten
+  ({NOVA_ABZUGSPOSTEN:.0f} €) über die Achtelung aliquotiert. E-Pkw: 0 €.
+  Tarif 2026: (CO₂ − 91)/5, Malus 80 €/g über 155 g/km.
+- **Gebrauchtimport** (>6 Monate *und* >6.000 km) löst keine österreichische
+  Erwerbsteuer aus – privat zahlst du den Bruttopreis des Herkunftslandes
+  plus NoVA, nicht „netto + 20 %“.
+- **Vorsteuerabzug** nur bei ausweisbarer MwSt.; bis 40.000 € brutto voll,
+  darüber auf {VORSTEUER_DECKEL:,.0f} € gedeckelt.
+- **Marktwert** = robuste log-lineare Regression auf Alter, Laufleistung und
+  Leistung innerhalb der Modellgruppe, Ausreißer getrimmt.
+- Ohne Gewähr, keine Steuerberatung.
+""".replace(",", ".")
+        )
+        for f in bericht.fehler[:20]:
+            st.text(f)
+
+
+if __name__ == "__main__":
+    main()
