@@ -246,5 +246,20 @@ luecke_naiv = abs(naiv[df2["Variante"].str.startswith("50")].mean()
 check(luecke_naiv > 10, "ohne Variantenmerkmale entstuende ein Scheinvorteil",
       f"{luecke_naiv:.0f} Prozentpunkte")
 
+# --- 6. Feinabstimmung / Overrides ------------------------------------------
+print("\n== Overrides ==")
+basis = r.suche_aus_url(
+    "https://www.autoscout24.de/lst/audi/e-tron?cy=D&custtype=D&atype=C")
+o1 = basis.mit(custtype="P")
+check(o1.params["custtype"] == "P", "Verkaeufertyp ueberschrieben")
+check(o1.pfad == "/lst/audi/e-tron", "Modellpfad bleibt beim Ueberschreiben")
+check(basis.params["custtype"] == "D", "Basissuche wird nicht mutiert")
+o2 = basis.mit(custtype="")
+check("custtype=" not in r.baue_url(o2, 1), "leerer Wert entfernt den Filter",
+      r.baue_url(o2, 1))
+o3 = basis.mit(cy="D,A,NL")
+check("cy=D,A,NL" in r.baue_url(o3, 1) and "custtype=D" in r.baue_url(o3, 1),
+      "nicht angefasste Filter bleiben erhalten")
+
 print("\n" + ("ALLE TESTS BESTANDEN" if ok else "ES GAB FEHLER"))
 sys.exit(0 if ok else 1)

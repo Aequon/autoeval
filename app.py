@@ -858,12 +858,120 @@ def _sidebar_filter() -> tuple[Suche, int, int, int]:
         help="20 Inserate/Seite. Bei vielen Treffern wird die Suche automatisch "
              "in Preisb\u00e4nder zerlegt, um das 400-Treffer-Limit zu umgehen.",
     )
-    st.sidebar.caption("Abgerufen wird:")
-    st.sidebar.code(baue_url(suche, 1), language=None)
     return suche, preis_von, preis_bis, max_seiten
 
 
-def _sidebar_profil() -> Kaufprofil:
+def _sidebar_feinabstimmung(suche: Suche) -> Suche:
+    """
+    Überschreibt einzelne Filter der Basissuche.
+
+    Wirkt sowohl auf eine eingefügte URL als auch auf das Formular. Jede
+    Einstellung hat "unverändert" als Default – so bleibt alles erhalten,
+    was in der URL steht und hier nicht angefasst wird.
+    """
+    st.sidebar.header("1b · Feinabstimmung")
+    st.sidebar.caption(
+        "Überschreibt die Basissuche. „unverändert“ lässt den Wert aus der "
+        "URL bzw. dem Formular stehen."
+    )
+    ueber: dict[str, str] = {}
+
+    verkaeufer = st.sidebar.selectbox(
+        "Verkäufer", ["unverändert", "Nur Händler", "Nur Privat", "Beide"],
+    )
+    if verkaeufer == "Nur Händler":
+        ueber["custtype"] = "D"
+    elif verkaeufer == "Nur Privat":
+        ueber["custtype"] = "P"
+    elif verkaeufer == "Beide":
+        ueber["custtype"] = ""
+
+    zustand = st.sidebar.selectbox(
+        "Zustand", ["unverändert", "Neu und gebraucht", "Nur Gebrauchtwagen",
+                    "Nur Neuwagen"],
+    )
+    if zustand == "Neu und gebraucht":
+        ueber["ustate"] = "N,U"
+    elif zustand == "Nur Gebrauchtwagen":
+        ueber["ustate"] = "U"
+    elif zustand == "Nur Neuwagen":
+        ueber["ustate"] = "N"
+
+    laender = st.sidebar.multiselect(
+        "Länder überschreiben", list(LAENDER), default=[],
+        help="Leer lassen = Länder aus der Basissuche behalten.",
+    )
+    if laender:
+        ueber["cy"] = ",".join(LAENDER[c] for c in laender)
+
+    if st.sidebar.checkbox("Erstzulassung überschreiben"):
+        bj_von, bj_bis = st.sidebar.select_slider(
+            "Erstzulassung",
+            options=list(range(2000, AKTUELLES_JAHR + 1)),
+            value=(2020, AKTUELLES_JAHR), label_visibility="collapsed",
+        )
+        ueber["fregfrom"], ueber["fregto"] = str(bj_von), str(bj_bis)
+
+    if st.sidebar.checkbox("Laufleistung überschreiben"):
+        km_von, km_bis = st.sidebar.slider(
+            "km", 0, 300_000, (0, 150_000), step=5_000,
+            label_visibility="collapsed",
+        )
+        ueber["kmfrom"], ueber["kmto"] = str(km_von), str(km_bis)
+
+    if st.sidebar.checkbox("Leistung überschreiben"):
+        kw_von, kw_bis = st.sidebar.slider(
+            "kW", 40, 600, (100, 400), step=10, label_visibility="collapsed",
+        )
+        ueber["powertype"] = "kw"
+        ueber["powerfrom"], ueber["powerto"] = str(kw_von), str(kw_bis)
+
+    getriebe = st.sidebar.selectbox(
+        "Getriebe", ["unverändert", "Egal", "Automatik", "Schaltgetriebe"],
+    )
+    if getriebe == "Automatik":
+        ueber["gear"] = "A"
+    elif getriebe == "Schaltgetriebe":
+        ueber["gear"] = "M"
+    elif getriebe == "Egal":
+        ueber["gear"] = ""
+
+    unfall = st.sidebar.selectbox(
+        "Unfallfahrzeuge", ["unverändert", "ausschließen", "einschließen"],
+    )
+    if unfall == "ausschließen":
+        ueber["damaged_listing"] = "exclude"
+    elif unfall == "einschließen":
+        ueber["damaged_listing"] = "include"
+
+    sortierung = st.sidebar.selectbox(
+        "Sortierung", ["unverändert", "Standard", "Preis aufsteigend",
+                       "Erstzulassung absteigend", "Laufleistung aufsteigend"],
+        help="Beeinflusst, welche Inserate innerhalb des Seitenlimits "
+             "geladen werden – nicht das Ranking selbst.",
+    )
+    sort_map = {
+        "Standard": ("standard", "0"),
+        "Preis aufsteigend": ("price", "0"),
+        "Erstzulassung absteigend": ("age", "1"),
+        "Laufleistung aufsteigend": ("mileage", "0"),
+    }
+    if sortierung in sort_map:
+        ueber["sort"], ueber["desc"] = sort_map[sortierung]
+
+    frei = st.sidebar.text_input(
+        "Weitere Parameter (roh)", value="",
+        placeholder="body=6&doorfrom=4",
+        help="Für alles, was hier nicht abgebildet ist: Parameter aus der "
+             "AutoScout-URL abschreiben, Form key=wert&key2=wert2.",
+    ).strip()
+    if frei:
+        for paar in frei.lstrip("?&").split("&"):
+            if "=" in paar:
+                k, v = paar.split("=", 1)
+                ueber[k.strip()] = urllib.parse.unquote(v.strip())
+
+    return suche.mit(**ueber) if ueber else suche
     st.sidebar.header("2 · Kaufprofil (Steuerlogik)")
     unternehmer = st.sidebar.checkbox(
         "Vorsteuerabzugsberechtigt (E-Pkw, betrieblich)",
@@ -889,6 +997,9 @@ def main() -> None:
     )
 
     suche, preis_von, preis_bis, max_seiten = _sidebar_filter()
+    suche = _sidebar_feinabstimmung(suche)
+    st.sidebar.caption("Tatsächlich abgerufen wird:")
+    st.sidebar.code(baue_url(suche, 1), language=None)
     profil = _sidebar_profil()
 
     if st.sidebar.button("🔍 Inserate laden", type="primary"):
