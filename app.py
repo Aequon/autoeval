@@ -619,24 +619,100 @@ def saeubern(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     return d.reset_index(drop=True), vorher - len(d)
 
 
-def _designmatrix(g: pd.DataFrame) -> np.ndarray:
+STOPPWOERTER = {
+    "quattro", "aut", "automatik", "dsg", "navi", "led", "shz", "ahk", "pano",
+    "kamera", "cam", "sitzheizung", "klima", "alu", "voll", "top", "gepflegt",
+    "garantie", "scheckheft", "unfallfrei", "netto", "export", "mwst",
+}
+
+
+def _tokens(text: str) -> set[str]:
+    """Variantentext in vergleichbare Merkmale zerlegen ('50', 'sportback')."""
+    roh = re.split(r"[^0-9a-zA-ZäöüÄÖÜß.]+", str(text).lower())
+    return {
+        t for t in roh
+        if t and t not in STOPPWOERTER
+        and (t.isdigit() or len(t) >= 3)
+        and not re.fullmatch(r"\d{5,}", t)
+    }
+
+
+def _variantenmerkmale(g: pd.DataFrame, min_anzahl: int = 8,
+                       max_anteil: float = 0.9) -> tuple[np.ndarray, list[str]]:
+    """
+    Baut Dummy-Spalten aus den häufigsten Variantentokens der Gruppe.
+
+    Ohne das vergleicht das Modell einen e-tron 50 gegen einen Topf aus
+    50, 55 und S – der schwächste Motor sieht dann automatisch wie ein
+    Schnäppchen aus. Mit '50'/'55'/'sportback' als Merkmal wird innerhalb
+    der Variante verglichen.
+    """
+    if "Variante" in g.columns:
+        texte = g["Variante"].fillna("")
+    elif "Bezeichnung" in g.columns:
+        texte = g["Bezeichnung"].fillna("")
+    else:
+        return np.zeros((len(g), 0)), []
+    dokumente = [_tokens(v) for v in texte]
+    zaehler: dict[str, int] = {}
+    for dok in dokumente:
+        for t in dok:
+            zaehler[t] = zaehler.get(t, 0) + 1
+    behalten = [
+        t for t, c in zaehler.items()
+        if c >= min_anzahl and c <= max_anteil * len(g)
+    ]
+    behalten = sorted(behalten, key=lambda t: -zaehler[t])[:15]
+    if not behalten:
+        return np.zeros((len(g), 0)), []
+    matrix = np.array([
+        [1.0 if t in dok else 0.0 for t in behalten] for dok in dokumente
+    ])
+    return matrix, behalten
+
+
+def _designmatrix(g: pd.DataFrame) -> tuple[np.ndarray, int, list[str]]:
     alter = np.maximum(0.25, AKTUELLES_JAHR + 0.5 - g["Baujahr"].to_numpy(float))
     km = np.maximum(100.0, g["KM"].to_numpy(float))
     kw = np.maximum(30.0, g["kW"].to_numpy(float))
-    return np.column_stack([
+    basis = np.column_stack([
         np.ones(len(g)), np.log(alter), np.log(km / 10_000.0), np.log(kw)
     ])
+    merkmale, namen = _variantenmerkmale(g)
+    if merkmale.shape[1] and len(g) >= 3 * merkmale.shape[1]:
+        return np.hstack([basis, merkmale]), basis.shape[1], namen
+    return basis, basis.shape[1], []
 
 
-def _fit_robust(X: np.ndarray, y: np.ndarray) -> np.ndarray:
-    """OLS auf log-Preis, danach einmal getrimmt nachfitten (Ausreißer raus)."""
-    beta, *_ = np.linalg.lstsq(X, y, rcond=None)
+def _fit_robust(X: np.ndarray, y: np.ndarray, n_basis: int | None = None,
+                lam: float = 0.5) -> np.ndarray:
+    """
+    Kleinste Quadrate auf log-Preis, Ausreißer werden einmal getrimmt.
+
+    Die Dummy-Spalten der Variantenmerkmale werden leicht regularisiert
+    (Ridge), damit seltene Tokens das Modell nicht überanpassen. Alter,
+    Laufleistung und Leistung bleiben unbestraft.
+    """
+    def loese(Xs: np.ndarray, ys: np.ndarray) -> np.ndarray:
+        p = Xs.shape[1]
+        if n_basis is None or p <= n_basis:
+            beta, *_ = np.linalg.lstsq(Xs, ys, rcond=None)
+            return beta
+        strafe = np.zeros((p - n_basis, p))
+        for i in range(p - n_basis):
+            strafe[i, n_basis + i] = math.sqrt(lam)
+        Xa = np.vstack([Xs, strafe])
+        ya = np.concatenate([ys, np.zeros(p - n_basis)])
+        beta, *_ = np.linalg.lstsq(Xa, ya, rcond=None)
+        return beta
+
+    beta = loese(X, y)
     resid = y - X @ beta
     mad = np.median(np.abs(resid - np.median(resid))) * 1.4826
     if mad > 1e-6:
         behalten = np.abs(resid) <= 2.5 * mad
         if behalten.sum() >= X.shape[1] + 3:
-            beta, *_ = np.linalg.lstsq(X[behalten], y[behalten], rcond=None)
+            beta = loese(X[behalten], y[behalten])
     return beta
 
 
@@ -661,14 +737,18 @@ def marktwert_modell(
 
     y_alle = np.log(d[zielspalte].to_numpy(float))
 
+    merkmale_log: dict[str, list[str]] = {}
+
     def anwenden(idx: pd.Index, label: str) -> None:
         g = d.loc[idx]
-        X = _designmatrix(g)
+        X, n_basis, namen = _designmatrix(g)
         y = y_alle[d.index.get_indexer(idx)]
-        beta = _fit_robust(X, y)
+        beta = _fit_robust(X, y, n_basis)
         d.loc[idx, "Erwartungspreis"] = np.exp(X @ beta)
         d.loc[idx, "Vergleichsgruppe"] = label
         d.loc[idx, "n_Vergleiche"] = len(idx)
+        if namen:
+            merkmale_log[label] = namen
 
     offen = set(d.index)
 
@@ -689,6 +769,8 @@ def marktwert_modell(
 
     if offen and len(d) >= 25:
         anwenden(pd.Index(sorted(offen)), "Gesamtmarkt (grob)")
+
+    d.attrs["variantenmerkmale"] = merkmale_log
 
     d["Preisvorteil_EUR"] = d["Erwartungspreis"] - d[zielspalte]
     d["Preisvorteil_Pct"] = d["Preisvorteil_EUR"] / d["Erwartungspreis"] * 100
@@ -902,6 +984,10 @@ def main() -> None:
         "Endpreis_AT", "Erwartungspreis", "Preisvorteil_EUR",
         "Preisvorteil_Pct", "Vergleichsgruppe", "n_Vergleiche", "Warnung",
     ]
+    gefiltert = gefiltert.copy()
+    if "kW_geschaetzt" in gefiltert.columns:
+        gefiltert["kW"] = np.where(gefiltert["kW_geschaetzt"], np.nan,
+                                   gefiltert["kW"])
     anzeige = gefiltert[spalten].rename(columns={
         "MwSt_ausweisbar": "MwSt. ausweisbar",
         "Bruttopreis": "Preis Herkunftsland",
@@ -932,6 +1018,17 @@ def main() -> None:
         "⬇︎ Ergebnis als CSV", puffer.getvalue(),
         file_name="autoscout_ranking.csv", mime="text/csv",
     )
+
+    merkmale = df.attrs.get("variantenmerkmale", {})
+    if merkmale:
+        with st.expander("Welche Varianten das Modell unterscheidet"):
+            st.caption(
+                "Aus den Inseratstiteln gewonnene Merkmale. Fehlt hier die "
+                "Motorisierung (z.\u202fB. 50 vs. 55), vergleicht das Modell "
+                "Varianten miteinander, die preislich nicht vergleichbar sind."
+            )
+            for gruppe, tokens in merkmale.items():
+                st.markdown(f"**{gruppe}**: " + ", ".join(f"`{t}`" for t in tokens))
 
     with st.expander("Preisvorteil nach Modell"):
         uebersicht = (

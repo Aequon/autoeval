@@ -197,5 +197,54 @@ za = r.parse_inserat(akku)
 check(not (70 <= (za["kW"] if za["kW"] == za["kW"] else 0) <= 80),
       "Akku-kWh nicht als Motorleistung missverstanden", str(za["kW"]))
 
+# --- 5. Variantentrennung ---------------------------------------------------
+print("\n== Variantenmerkmale ==")
+check(r._tokens("Sportback 50 quattro LED Navi") == {"sportback", "50"},
+      "Tokens: Motorisierung bleibt, Ausstattung faellt raus",
+      str(sorted(r._tokens("Sportback 50 quattro LED Navi"))))
+
+# Zwei Motorisierungen mit echtem Preisunterschied im selben Modell
+rng2 = np.random.default_rng(7)
+zeilen2 = []
+for i in range(160):
+    stark = i % 2 == 0
+    jahr = int(rng2.integers(2020, 2024))
+    km = float(rng2.integers(20_000, 140_000))
+    fair = (46_000 if stark else 32_000) * np.exp(-0.15 * (2026.5 - jahr)) \
+        * np.exp(-0.0000022 * km)
+    zeilen2.append({"ID": f"v{i}", "Marke": "Audi", "Modell": "e-tron",
+                    "Variante": "55 quattro advanced" if stark else "50 quattro advanced",
+                    "Bezeichnung": "Audi e-tron", "Baujahr": jahr, "KM": km,
+                    "kW": 100.0, "CO2": 0.0, "Elektro": True, "Land": "DE",
+                    "Kraftstoff": "Elektro", "USt_Satz": 1.19,
+                    "MwSt_ausweisbar": False, "Verkäufer": "Händler",
+                    "Bruttopreis": round(fair * float(rng2.normal(1.0, 0.04))),
+                    "Link": ""})
+df2 = pd.DataFrame(zeilen2)
+df2, _ = r.saeubern(df2)
+df2 = pd.concat([df2, df2.apply(lambda z: r.endpreis_at(z, profil_privat), axis=1)], axis=1)
+res3 = r.marktwert_modell(df2)
+
+schwach = res3[res3["Variante"].str.startswith("50")]["Preisvorteil_Pct"].mean()
+stark_m = res3[res3["Variante"].str.startswith("55")]["Preisvorteil_Pct"].mean()
+check(abs(schwach - stark_m) < 6,
+      "schwache Variante gilt nicht pauschal als Schnaeppchen",
+      f"50er {schwach:+.1f} % vs 55er {stark_m:+.1f} %")
+check("50" in res3.attrs["variantenmerkmale"].get("Audi e-tron", []),
+      "Motorisierung als Merkmal erkannt",
+      str(res3.attrs["variantenmerkmale"].get("Audi e-tron")))
+
+# Gegenprobe: ohne Merkmale waere die Verzerrung gross
+X_basis = np.column_stack([np.ones(len(df2)),
+                           np.log(2026.5 - df2["Baujahr"].to_numpy(float)),
+                           np.log(df2["KM"].to_numpy(float) / 10_000),
+                           np.log(np.maximum(30, df2["kW"].to_numpy(float)))])
+b = r._fit_robust(X_basis, np.log(df2["Endpreis_AT"].to_numpy(float)))
+naiv = (np.exp(X_basis @ b) - df2["Endpreis_AT"]) / np.exp(X_basis @ b) * 100
+luecke_naiv = abs(naiv[df2["Variante"].str.startswith("50")].mean()
+                  - naiv[df2["Variante"].str.startswith("55")].mean())
+check(luecke_naiv > 10, "ohne Variantenmerkmale entstuende ein Scheinvorteil",
+      f"{luecke_naiv:.0f} Prozentpunkte")
+
 print("\n" + ("ALLE TESTS BESTANDEN" if ok else "ES GAB FEHLER"))
 sys.exit(0 if ok else 1)
