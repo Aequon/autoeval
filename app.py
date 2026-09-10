@@ -972,6 +972,9 @@ def _sidebar_feinabstimmung(suche: Suche) -> Suche:
                 ueber[k.strip()] = urllib.parse.unquote(v.strip())
 
     return suche.mit(**ueber) if ueber else suche
+
+
+def _sidebar_profil() -> Kaufprofil:
     st.sidebar.header("2 · Kaufprofil (Steuerlogik)")
     unternehmer = st.sidebar.checkbox(
         "Vorsteuerabzugsberechtigt (E-Pkw, betrieblich)",

@@ -1,4 +1,5 @@
 """Smoke-Test: Steuerlogik + Marktwertmodell ohne Streamlit/Netzwerk."""
+import re
 import sys, types
 import numpy as np
 import pandas as pd
@@ -260,6 +261,29 @@ check("custtype=" not in r.baue_url(o2, 1), "leerer Wert entfernt den Filter",
 o3 = basis.mit(cy="D,A,NL")
 check("cy=D,A,NL" in r.baue_url(o3, 1) and "custtype=D" in r.baue_url(o3, 1),
       "nicht angefasste Filter bleiben erhalten")
+
+# --- 7. UI-Funktionen vorhanden ---------------------------------------------
+# Faengt Bearbeitungsfehler ab, bei denen eine def-Zeile verlorengeht und der
+# Rumpf still an der Funktion darueber haengenbleibt.
+print("\n== Modulstruktur ==")
+import inspect  # noqa: E402
+for name in ("_sidebar_filter", "_sidebar_feinabstimmung", "_sidebar_profil",
+             "main", "scrape", "scrape_mit_preisbaendern", "marktwert_modell",
+             "endpreis_at", "saeubern", "parse_inserat", "baue_url",
+             "suche_aus_url"):
+    check(callable(getattr(r, name, None)), f"{name}() definiert")
+
+import ast  # noqa: E402
+
+baum = ast.parse(open(r.__file__, encoding="utf-8").read())
+tot = []
+for knoten in ast.walk(baum):
+    if isinstance(knoten, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        for k, anweisung in enumerate(knoten.body[:-1]):
+            if isinstance(anweisung, ast.Return):
+                tot.append(f"{knoten.name} (ab Zeile {knoten.body[k+1].lineno})")
+                break
+check(not tot, "kein unerreichbarer Code nach einem return", "; ".join(tot))
 
 print("\n" + ("ALLE TESTS BESTANDEN" if ok else "ES GAB FEHLER"))
 sys.exit(0 if ok else 1)
