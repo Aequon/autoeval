@@ -22,7 +22,7 @@ for name in ("set_page_config", "title", "caption", "sidebar", "progress",
     setattr(stub, name, _Any())
 sys.modules["streamlit"] = stub
 
-import autoscout_ranker as r  # noqa: E402
+import app as r  # noqa: E402
 
 ok = True
 
