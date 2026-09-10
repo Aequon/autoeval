@@ -266,6 +266,15 @@ def _tiefensuche(obj: Any, muster: str, pruef: Callable[[Any], bool],
     return None
 
 
+def _ganzzahl(wert: Any, standard: int = 0) -> int:
+    """int() ohne NaN-Falle: fehlende Werte fallen auf den Standard zurueck.
+
+    "NaN or 0" hilft nicht, weil NaN wahrheitswertig True ist.
+    """
+    z = _zahl(wert)
+    return int(z) if np.isfinite(z) else standard
+
+
 def _numerisch(unten: float, oben: float) -> Callable[[Any], bool]:
     def pruef(v: Any) -> bool:
         z = _zahl(v)
@@ -463,14 +472,14 @@ def _finde_listings(daten: dict) -> tuple[list, int, int]:
     such = hole(props, "searchResult", "listings.searchResult", default={}) or {}
     listings = (hole(such, "listings") or hole(props, "listings")
                 or hole(daten, "listings") or [])
-    seiten = int(_zahl(hole(such, "numberOfPages",
-                            default=hole(props, "numberOfPages", default=1))) or 1)
-    treffer = int(_zahl(hole(such, "totalMatches", "numberOfResults",
-                             default=hole(props, "totalMatches", default=0))) or 0)
+    seiten = max(1, _ganzzahl(hole(such, "numberOfPages",
+                                   default=hole(props, "numberOfPages")), 1))
+    treffer = _ganzzahl(hole(such, "totalMatches", "numberOfResults",
+                             default=hole(props, "totalMatches")), 0)
     if not treffer:
-        treffer = int(_zahl(_tiefensuche(
+        treffer = _ganzzahl(_tiefensuche(
             props, r"totalMatches|numberOfResults|resultCount|totalCount",
-            _numerisch(1, 5_000_000))) or 0)
+            _numerisch(1, 5_000_000)), 0)
     return listings, seiten, treffer
 
 
@@ -521,7 +530,14 @@ def scrape(
             )
             break
 
-        roh, seiten_gesamt, treffer = _finde_listings(daten)
+        try:
+            roh, seiten_gesamt, treffer = _finde_listings(daten)
+        except Exception as exc:                           # noqa: BLE001
+            bericht.fehler.append(
+                f"Seite {seite}: Auswertung fehlgeschlagen "
+                f"({type(exc).__name__}: {exc})"
+            )
+            break
         bericht.treffer_gesamt = max(bericht.treffer_gesamt, treffer)
         if not roh:
             break

@@ -262,6 +262,29 @@ o3 = basis.mit(cy="D,A,NL")
 check("cy=D,A,NL" in r.baue_url(o3, 1) and "custtype=D" in r.baue_url(o3, 1),
       "nicht angefasste Filter bleiben erhalten")
 
+# --- 6b. Robustheit gegen fehlende Felder -----------------------------------
+print("\n== _finde_listings ==")
+check(r._ganzzahl(None, 7) == 7, "None -> Standardwert")
+check(r._ganzzahl(float("nan"), 3) == 3, "NaN -> Standardwert (nicht int(NaN))")
+check(r._ganzzahl("1.234", 0) == 1234, "formatierte Zahl gelesen")
+check(r._ganzzahl(0, 5) == 0, "echte Null bleibt Null")
+
+# Genau der Absturzfall: Seite ohne Treffer-/Seitenzahlen
+leer = {"props": {"pageProps": {"listings": [{"a": 1}]}}}
+lst, seiten, treffer = r._finde_listings(leer)
+check(len(lst) == 1 and seiten == 1 and treffer == 0,
+      "Seite ohne totalMatches stuerzt nicht ab", f"{seiten=} {treffer=}")
+lst2, s2, t2 = r._finde_listings({})
+check(lst2 == [] and s2 == 1 and t2 == 0, "voellig leeres JSON toleriert")
+voll = {"props": {"pageProps": {"searchResult": {
+    "listings": [{"a": 1}], "numberOfPages": 12, "totalMatches": 231}}}}
+_, s3, t3 = r._finde_listings(voll)
+check(s3 == 12 and t3 == 231, "vorhandene Werte werden gelesen", f"{s3=} {t3=}")
+tief_t = {"props": {"pageProps": {"listings": [{"a": 1}],
+                                  "meta": {"resultCount": 88}}}}
+_, _, t4 = r._finde_listings(tief_t)
+check(t4 == 88, "Trefferzahl per Tiefensuche", str(t4))
+
 # --- 7. UI-Funktionen vorhanden ---------------------------------------------
 # Faengt Bearbeitungsfehler ab, bei denen eine def-Zeile verlorengeht und der
 # Rumpf still an der Funktion darueber haengenbleibt.
