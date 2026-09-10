@@ -153,10 +153,49 @@ check(z["MwSt_ausweisbar"] is True, "MwSt-Flag gelesen")
 check(z["Link"].startswith("https://www.autoscout24.de/angebote"), "Link gebaut")
 check(r.parse_inserat({"price": {}}) is None, "Inserat ohne Preis verworfen")
 check(r.hole({"a": {"b": 1}}, "x.y", "a.b") == 1, "Fallback-Pfade")
-p2 = r.params_aus_url("https://www.autoscout24.de/lst?cy=D%2CA&fuel=E&page=3&fregfrom=2021")
-check(p2 == {"cy": "D,A", "fuel": "E", "fregfrom": "2021"}, "URL-Parser", str(p2))
-u = r.baue_url({"cy": "D,A", "fuel": "E"}, 2)
-check("page=2" in u and "cy=D,A" in u and "atype=C" in u, "URL-Bau", u)
+s1 = r.suche_aus_url("https://www.autoscout24.de/lst?cy=D%2CA&fuel=E&page=3&fregfrom=2021")
+check(s1.params == {"cy": "D,A", "fuel": "E", "fregfrom": "2021"}, "URL-Parser", str(s1.params))
+check(s1.pfad == "/lst", "ohne Modell -> /lst")
+
+# Der eigentliche Bug: Marke/Modell stehen im Pfad, nicht in den Params
+s2 = r.suche_aus_url(
+    "https://www.autoscout24.de/lst/audi/e-tron?sort=standard&desc=0"
+    "&ustate=N%2CU&cy=D&ocs_listing=include&damaged_listing=exclude"
+    "&atype=C&source=homepage_search-mask")
+check(s2.pfad == "/lst/audi/e-tron", "Marke/Modell aus dem Pfad uebernommen", s2.pfad)
+check("source" not in s2.params, "source-Parameter entfernt")
+u2 = r.baue_url(s2, 2)
+check("/lst/audi/e-tron?" in u2 and "page=2" in u2, "URL-Bau mit Modellpfad", u2)
+check(r.baue_url(r.Suche(), 1).startswith("https://www.autoscout24.de/lst?"), "Default-Pfad")
+check(r.suche_aus_url("https://boese.example/evil?x=1").pfad == "/lst", "fremder Pfad verworfen")
+
+# Kraftstoff-Codes
+check(r._kraftstoff_klartext("e") == "Elektro", "Code 'e' -> Elektro")
+check(r._kraftstoff_klartext("d") == "Diesel", "Code 'd' -> Diesel")
+check(r._kraftstoff_klartext("2").startswith("Hybrid"), "Code '2' -> Hybrid")
+check(r._kraftstoff_klartext("Elektro") == "Elektro", "Klartext bleibt")
+
+z_e = r.parse_inserat({"price": {"priceInEuro": 30000},
+                       "vehicle": {"make": "Polestar", "model": "2",
+                                   "fuelType": "e",
+                                   "firstRegistrationDateRaw": "2023-01-01"},
+                       "tracking": {"mileage": 50000}, "url": "/x"})
+check(z_e["Elektro"] and z_e["Kraftstoff"] == "Elektro", "Code-Auto als Elektro erkannt")
+
+# Tiefensuche: kW/CO2 unter unbekannten Schluesseln
+tief = {"price": {"priceInEuro": 25000}, "vehicle": {"make": "VW", "model": "Golf",
+        "firstRegistrationDateRaw": "2021-06-01"},
+        "irgendwo": {"tief": {"enginePower": 110, "co2Value": 132}},
+        "tracking": {"mileage": 60000}, "url": "/y"}
+zt = r.parse_inserat(tief)
+check(abs(zt["kW"] - 110) < 1, "kW per Tiefensuche gefunden", str(zt["kW"]))
+check(abs(zt["CO2"] - 132) < 1, "CO2 per Tiefensuche gefunden", str(zt["CO2"]))
+akku = {"price": {"priceInEuro": 25000}, "vehicle": {"make": "X", "model": "Y",
+        "firstRegistrationDateRaw": "2022-01-01", "batteryCapacityInKWh": 78},
+        "tracking": {"mileage": 10000}, "url": "/z"}
+za = r.parse_inserat(akku)
+check(not (70 <= (za["kW"] if za["kW"] == za["kW"] else 0) <= 80),
+      "Akku-kWh nicht als Motorleistung missverstanden", str(za["kW"]))
 
 print("\n" + ("ALLE TESTS BESTANDEN" if ok else "ES GAB FEHLER"))
 sys.exit(0 if ok else 1)

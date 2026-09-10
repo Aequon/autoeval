@@ -238,6 +238,57 @@ def _zahl(wert: Any) -> float:
         return float("nan")
 
 
+def _tiefensuche(obj: Any, muster: str, pruef: Callable[[Any], bool],
+                 tiefe: int = 0) -> Any:
+    """
+    Sucht rekursiv nach einem Schlüssel, dessen Name zum Muster passt und
+    dessen Wert plausibel ist. Nötig, weil AutoScout die JSON-Struktur
+    regelmäßig umbaut und feste Pfade dann still ins Leere laufen –
+    genau das war die Ursache für "kW = 100 bei jedem Auto".
+    """
+    if tiefe > 6:
+        return None
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if re.search(muster, k, re.I) and pruef(v):
+                return v
+        for v in obj.values():
+            if isinstance(v, (dict, list)):
+                treffer = _tiefensuche(v, muster, pruef, tiefe + 1)
+                if treffer is not None:
+                    return treffer
+    elif isinstance(obj, list):
+        for v in obj[:25]:
+            if isinstance(v, (dict, list)):
+                treffer = _tiefensuche(v, muster, pruef, tiefe + 1)
+                if treffer is not None:
+                    return treffer
+    return None
+
+
+def _numerisch(unten: float, oben: float) -> Callable[[Any], bool]:
+    def pruef(v: Any) -> bool:
+        z = _zahl(v)
+        return bool(np.isfinite(z) and unten <= z <= oben)
+    return pruef
+
+
+# AutoScout liefert Kraftstoff teils als Einbuchstaben-Code statt als Text.
+KRAFTSTOFF_CODES = {
+    "b": "Benzin", "d": "Diesel", "e": "Elektro", "l": "Autogas (LPG)",
+    "c": "Erdgas (CNG)", "m": "Ethanol", "h": "Wasserstoff",
+    "2": "Hybrid (Benzin/Elektro)", "3": "Hybrid (Diesel/Elektro)",
+    "o": "Sonstige",
+}
+
+
+def _kraftstoff_klartext(roh: str) -> str:
+    schluessel = str(roh).strip().lower()
+    if schluessel in KRAFTSTOFF_CODES:
+        return KRAFTSTOFF_CODES[schluessel]
+    return str(roh).strip() or "unbekannt"
+
+
 def parse_inserat(item: dict) -> dict | None:
     """Ein Roh-Inserat in eine flache Zeile übersetzen. None = unbrauchbar."""
     preis = _zahl(hole(
@@ -268,19 +319,34 @@ def parse_inserat(item: dict) -> dict | None:
     km = _zahl(hole(
         item, "tracking.mileage", "vehicle.mileageInKmRaw", "vehicle.mileage",
     ))
+    if not np.isfinite(km):
+        km = _zahl(_tiefensuche(item, r"mileage|kilometer|^km$",
+                                _numerisch(0, 600_000)))
+
     kw = _zahl(hole(
         item, "tracking.powerInKW", "vehicle.rawPowerInKw", "vehicle.powerInKw",
     ))
+    if not np.isfinite(kw) or kw <= 0:
+        # "power" zuerst; "kw" nur als Notnagel und ohne kWh-Akkuangaben
+        kw = _zahl(_tiefensuche(item, r"power(?!.*hp)", _numerisch(20, 1200)))
+        if not np.isfinite(kw):
+            ps = _zahl(_tiefensuche(item, r"\bhp\b|horsepower|^ps$",
+                                    _numerisch(30, 1600)))
+            kw = ps / 1.36 if np.isfinite(ps) else float("nan")
+
     co2 = _zahl(hole(
         item,
         "tracking.co2Emission", "vehicle.co2EmissionInGramPerKm",
         "vehicle.emissionClass.co2", "vehicle.co2Emissions",
     ))
+    if not np.isfinite(co2):
+        co2 = _zahl(_tiefensuche(item, r"co2", _numerisch(0, 600)))
 
-    kraftstoff = str(hole(
-        item, "vehicle.fuelCategory.formatted", "tracking.fuelType",
-        "vehicle.fuelType", default="",
+    kraftstoff_roh = str(hole(
+        item, "vehicle.fuelCategory.formatted", "vehicle.fuelType",
+        "tracking.fuelType", "vehicle.fuelCategory", default="",
     ))
+    kraftstoff = _kraftstoff_klartext(kraftstoff_roh)
     ist_elektro = bool(re.search(r"elektro|electric|\bev\b", kraftstoff, re.I))
     if ist_elektro:
         co2 = 0.0
@@ -321,7 +387,7 @@ def parse_inserat(item: dict) -> dict | None:
         "KM": km,
         "kW": kw,
         "CO2": co2,
-        "Kraftstoff": kraftstoff or "unbekannt",
+        "Kraftstoff": kraftstoff,
         "Elektro": ist_elektro,
         "Land": land,
         "USt_Satz": ust_saetze.get(land, 1.20),
@@ -333,22 +399,42 @@ def parse_inserat(item: dict) -> dict | None:
     }
 
 
-def baue_url(filter_params: dict[str, str], seite: int) -> str:
-    params = {k: v for k, v in filter_params.items() if v not in ("", None)}
+@dataclass
+class Suche:
+    """Eine AutoScout24-Suche: Pfad (Marke/Modell) + Query-Filter.
+
+    Wichtig: AutoScout kodiert Marke und Modell im PFAD (/lst/audi/e-tron),
+    nicht als Query-Parameter. Wer nur den Teil nach dem "?" übernimmt,
+    sucht plötzlich den ganzen Markt ab.
+    """
+    pfad: str = "/lst"
+    params: dict[str, str] = field(default_factory=dict)
+
+    def mit(self, **extra: str) -> "Suche":
+        return Suche(self.pfad, dict(self.params, **extra))
+
+
+def baue_url(suche: Suche, seite: int) -> str:
+    params = {k: v for k, v in suche.params.items() if v not in ("", None)}
     params["page"] = str(seite)
     params.setdefault("atype", "C")
     params.setdefault("ustate", "N,U")
     params.setdefault("size", str(TREFFER_PRO_SEITE))
-    return f"{BASIS_URL}?{urllib.parse.urlencode(params, safe=',')}"
+    pfad = suche.pfad if suche.pfad.startswith("/") else "/" + suche.pfad
+    return (f"https://www.autoscout24.de{pfad}"
+            f"?{urllib.parse.urlencode(params, safe=',')}")
 
 
-def params_aus_url(url: str) -> dict[str, str]:
-    """Erlaubt: fertige Suche im Browser bauen und URL hier einfügen."""
+def suche_aus_url(url: str) -> Suche:
+    """Fertige Suche im Browser bauen, URL hier einfügen – inkl. Pfad."""
     zerlegt = urllib.parse.urlparse(url)
     params = {k: v[0] for k, v in urllib.parse.parse_qs(zerlegt.query).items()}
-    params.pop("page", None)
-    params.pop("search_id", None)
-    return params
+    for weg in ("page", "search_id", "source", "sort_id"):
+        params.pop(weg, None)
+    pfad = zerlegt.path or "/lst"
+    if not pfad.startswith("/lst"):
+        pfad = "/lst"
+    return Suche(pfad.rstrip("/"), params)
 
 
 def _extrahiere_json(html: str) -> dict | None:
@@ -381,6 +467,10 @@ def _finde_listings(daten: dict) -> tuple[list, int, int]:
                             default=hole(props, "numberOfPages", default=1))) or 1)
     treffer = int(_zahl(hole(such, "totalMatches", "numberOfResults",
                              default=hole(props, "totalMatches", default=0))) or 0)
+    if not treffer:
+        treffer = int(_zahl(_tiefensuche(
+            props, r"totalMatches|numberOfResults|resultCount|totalCount",
+            _numerisch(1, 5_000_000))) or 0)
     return listings, seiten, treffer
 
 
@@ -389,10 +479,11 @@ class Abrufbericht:
     seiten_geladen: int = 0
     treffer_gesamt: int = 0
     fehler: list[str] = field(default_factory=list)
+    roh_beispiel: dict | None = None   # erstes Rohinserat, fuer die Diagnose
 
 
 def scrape(
-    filter_params: dict[str, str],
+    suche: Suche,
     max_seiten: int,
     bericht: Abrufbericht,
     fortschritt: Callable[[float, str], None] | None = None,
@@ -407,7 +498,7 @@ def scrape(
     seite, seiten_gesamt = 1, 1
 
     while seite <= min(seiten_gesamt, max_seiten, MAX_SEITEN_AS24):
-        url = baue_url(filter_params, seite)
+        url = baue_url(suche, seite)
         html = None
         for versuch in range(3):
             try:
@@ -435,6 +526,9 @@ def scrape(
         if not roh:
             break
 
+        if bericht.roh_beispiel is None and roh:
+            bericht.roh_beispiel = roh[0]
+
         for item in roh:
             zeile = parse_inserat(item)
             if zeile:
@@ -452,7 +546,7 @@ def scrape(
 
 
 def scrape_mit_preisbaendern(
-    filter_params: dict[str, str],
+    suche: Suche,
     preis_von: int,
     preis_bis: int,
     max_seiten: int,
@@ -465,7 +559,7 @@ def scrape_mit_preisbaendern(
     """
     bericht = Abrufbericht()
 
-    sonde = dict(filter_params, pricefrom=str(preis_von), priceto=str(preis_bis))
+    sonde = suche.mit(pricefrom=str(preis_von), priceto=str(preis_bis))
     erste = scrape(sonde, 1, bericht)
     gesamt = bericht.treffer_gesamt or len(erste)
 
@@ -483,7 +577,7 @@ def scrape_mit_preisbaendern(
     for i in range(len(grenzen) - 1):
         von = grenzen[i] + (1 if i else 0)
         bis = grenzen[i + 1]
-        band = dict(filter_params, pricefrom=str(von), priceto=str(bis))
+        band = suche.mit(pricefrom=str(von), priceto=str(bis))
 
         def melde(p: float, txt: str, i=i, von=von, bis=bis) -> None:
             if fortschritt:
@@ -515,7 +609,8 @@ def saeubern(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
         & d["Baujahr"].between(1990, AKTUELLES_JAHR + 1)
         & (d["KM"].fillna(0) <= 600_000)
     ]
-    # kW fehlend -> Median der Modellgruppe
+    # kW fehlend -> Median der Modellgruppe, aber sichtbar markiert
+    d["kW_geschaetzt"] = d["kW"].isna()
     d["kW"] = d.groupby(["Marke", "Modell"])["kW"].transform(
         lambda s: s.fillna(s.median())
     )
@@ -611,37 +706,58 @@ def marktwert_modell(
 # 4. UI
 # =============================================================================
 
-def _sidebar_filter() -> tuple[dict[str, str], int, int, int]:
-    st.sidebar.header("1 · Suche")
+def _sidebar_filter() -> tuple[Suche, int, int, int]:
+    st.sidebar.header("1 \u00b7 Suche")
 
     modus = st.sidebar.radio(
-        "Filter definieren über",
+        "Filter definieren \u00fcber",
         ["Eigene AutoScout24-URL", "Formular"],
         help="Am robustesten: Suche im Browser zusammenklicken, URL kopieren, "
-             "hier einfügen. Dann stimmen Karosserie-/Ausstattungscodes sicher.",
+             "hier einf\u00fcgen. Marke und Modell stecken bei AutoScout im Pfad "
+             "(/lst/audi/e-tron) und werden mit \u00fcbernommen.",
     )
 
     if modus == "Eigene AutoScout24-URL":
         url = st.sidebar.text_area(
-            "URL einfügen", height=90,
-            placeholder="https://www.autoscout24.de/lst/...",
+            "URL einf\u00fcgen", height=90,
+            placeholder="https://www.autoscout24.de/lst/audi/e-tron?...",
         )
-        params = params_aus_url(url) if url.strip() else {}
-        if url.strip() and not params:
-            st.sidebar.error("Konnte keine Filter aus der URL lesen.")
+        suche = suche_aus_url(url) if url.strip() else Suche()
+        if url.strip():
+            if suche.pfad != "/lst":
+                st.sidebar.caption(f"Modellfilter erkannt: `{suche.pfad}`")
+            else:
+                st.sidebar.warning(
+                    "Kein Marke/Modell im Pfad \u2013 die Suche l\u00e4uft \u00fcber den "
+                    "gesamten Markt. F\u00fcr ein brauchbares Ranking besser ein "
+                    "konkretes Modell w\u00e4hlen."
+                )
     else:
         laender = st.sidebar.multiselect(
-            "Länder", list(LAENDER), default=["DE", "AT"],
-            help="Dänemark ist kein AutoScout24-Markt und daher nicht wählbar.",
+            "L\u00e4nder", list(LAENDER), default=["DE", "AT"],
+            help="D\u00e4nemark ist kein AutoScout24-Markt und daher nicht w\u00e4hlbar.",
         )
+        marke = st.sidebar.text_input(
+            "Marke", value="", placeholder="audi",
+            help="Kleinschreibung wie in der AS24-URL, z.\u202fB. audi, bmw, vw.",
+        ).strip().lower()
+        modell = st.sidebar.text_input(
+            "Modell", value="", placeholder="e-tron",
+        ).strip().lower()
         kraftstoff = st.sidebar.selectbox("Antrieb", list(KRAFTSTOFF), index=0)
-        nur_haendler = st.sidebar.checkbox("Nur Händler", value=True)
+        nur_haendler = st.sidebar.checkbox("Nur H\u00e4ndler", value=True)
         bj_von, bj_bis = st.sidebar.select_slider(
             "Erstzulassung", options=list(range(2010, AKTUELLES_JAHR + 1)),
             value=(2021, AKTUELLES_JAHR),
         )
         km_max = st.sidebar.number_input("km max.", 0, 500_000, 120_000, 10_000)
-        params = {
+
+        pfad = "/lst"
+        if marke:
+            pfad += "/" + urllib.parse.quote(marke)
+            if modell:
+                pfad += "/" + urllib.parse.quote(modell)
+        suche = Suche(pfad, {
             "cy": ",".join(LAENDER[c] for c in laender),
             "fuel": KRAFTSTOFF[kraftstoff],
             "custtype": "D" if nur_haendler else "",
@@ -649,18 +765,20 @@ def _sidebar_filter() -> tuple[dict[str, str], int, int, int]:
             "kmto": str(int(km_max)),
             "damaged_listing": "exclude",
             "sort": "standard", "desc": "0",
-        }
+        })
 
     preis_von, preis_bis = st.sidebar.slider(
-        "Preisbereich im Herkunftsland (€)",
+        "Preisbereich im Herkunftsland (\u20ac)",
         2_000, 120_000, (20_000, 38_000), step=1_000,
     )
     max_seiten = st.sidebar.slider(
         "Seiten je Preisband", 1, MAX_SEITEN_AS24, 8,
         help="20 Inserate/Seite. Bei vielen Treffern wird die Suche automatisch "
-             "in Preisbänder zerlegt, um das 400-Treffer-Limit zu umgehen.",
+             "in Preisb\u00e4nder zerlegt, um das 400-Treffer-Limit zu umgehen.",
     )
-    return params, preis_von, preis_bis, max_seiten
+    st.sidebar.caption("Abgerufen wird:")
+    st.sidebar.code(baue_url(suche, 1), language=None)
+    return suche, preis_von, preis_bis, max_seiten
 
 
 def _sidebar_profil() -> Kaufprofil:
@@ -688,7 +806,7 @@ def main() -> None:
         "und USt-Logik gegen einen aus den Daten geschätzten Marktwert."
     )
 
-    params, preis_von, preis_bis, max_seiten = _sidebar_filter()
+    suche, preis_von, preis_bis, max_seiten = _sidebar_filter()
     profil = _sidebar_profil()
 
     if st.sidebar.button("🔍 Inserate laden", type="primary"):
@@ -701,7 +819,7 @@ def main() -> None:
 
         with st.spinner("Lade AutoScout24 …"):
             df, bericht = scrape_mit_preisbaendern(
-                params, preis_von, preis_bis, max_seiten, fortschritt
+                suche, preis_von, preis_bis, max_seiten, fortschritt
             )
         balken.empty()
         text.empty()
@@ -843,8 +961,16 @@ def main() -> None:
 - Ohne Gewähr, keine Steuerberatung.
 """.replace(",", ".")
         )
+        st.caption("Abgerufene URL (Seite 1):")
+        st.code(baue_url(suche, 1), language=None)
         for f in bericht.fehler[:20]:
             st.text(f)
+        if bericht.roh_beispiel is not None:
+            st.caption(
+                "Rohdaten des ersten Inserats \u2013 hier siehst du, unter welchen "
+                "Schl\u00fcsseln AutoScout aktuell kW und CO\u2082 liefert:"
+            )
+            st.json(bericht.roh_beispiel, expanded=False)
 
 
 if __name__ == "__main__":
